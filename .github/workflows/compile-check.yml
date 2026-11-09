@@ -2,7 +2,7 @@ name: Renderer PR compile check
 
 on:
   pull_request:
-    branches: [main]
+    branches: [ryty-gpu]
 
 permissions:
   contents: read
