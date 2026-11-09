@@ -28,6 +28,11 @@ layout (push_constant) uniform settings {
     bool hud;
     float hud_x0;
     float hud_x1;
+    // HDR post-processing settings
+    float hdr_gain;
+    float hdr_saturation;
+    u32 hdr_input_709;
+    float hdr_peak_nits;
 } pp;
 
 #define A_GPU 1
