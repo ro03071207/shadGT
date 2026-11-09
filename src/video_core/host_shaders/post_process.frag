@@ -23,9 +23,10 @@ layout (std140, binding = 3) uniform HudLayout {
 
 layout (push_constant) uniform settings {
     float gamma;
-    bool hdr;
-    bool srgb_input;
-    bool hud;
+    // ryGT: C++ uses u32 for boolean fields; match with uint and explicit comparisons.
+    uint hdr;
+    uint srgb_input;
+    uint hud;
     float hud_x0;
     float hud_x1;
     // HDR post-processing settings
@@ -75,7 +76,7 @@ vec3 hdr_adjust(vec3 pq) {
     // Saturation around the BT.2020 luminance.
     float lum = dot(nits, vec3(0.2627, 0.6780, 0.0593));
     nits = max(vec3(lum) + (nits - vec3(lum)) * pp.hdr_saturation, vec3(0.0));
-    if (pp.hdr_input_709) {
+    if (pp.hdr_input_709 != 0u) {
         nits = max(bt709_to_bt2020 * nits, vec3(0.0));
     }
     if (pp.hdr_peak_nits <= 0.0) {
@@ -117,7 +118,7 @@ bool inside(vec2 p, vec4 rect) {
 
 void main() {
     vec4 color_linear = texture(texSampler, uv);
-    if (pp.hud) {
+    if (pp.hud != 0u) {
         // Where on the 16:9 HUD this pixel shows: a placed piece's, else the centred HUD's
         // (but not what a piece shows elsewhere).
         bool shown = false;
@@ -150,10 +151,10 @@ void main() {
             color_linear.rgb = color_linear.rgb * (1.0 - coverage) + black;
         }
     }
-    if (pp.hdr) {
+    if (pp.hdr != 0u) {
         color = color_linear;
     } else {
-        if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
+        if (pp.srgb_input != 0u) color_linear.rgb = degamma(color_linear.rgb);
         color = vec4(gamma(color_linear.rgb), color_linear.a);
     }
 }
