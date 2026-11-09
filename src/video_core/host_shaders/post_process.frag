@@ -31,7 +31,7 @@ layout (push_constant) uniform settings {
     // HDR post-processing settings
     float hdr_gain;
     float hdr_saturation;
-    u32 hdr_input_709;
+    uint hdr_input_709;
     float hdr_peak_nits;
 } pp;
 
