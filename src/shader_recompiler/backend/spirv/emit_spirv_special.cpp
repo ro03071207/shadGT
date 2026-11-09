@@ -22,10 +22,15 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     const auto& tcs = ctx.runtime_info.sw.tcs;
     const u32 num_cp = std::max(tcs.num_input_control_points, 1u);
     const u32 num_attrs = (tcs.ls_stride + 15) / 16;
-    // GCN generic interface has 32 vec4 locations. The same rounded stride
-    // is used by the reader and the renderer's scratch allocation.
-    if (num_attrs == 0 || num_attrs > 32 || num_cp > 32)
-        throw Common::RecoverableFailure{"Tessellation LDS stride exceeds generic interface"};
+    // FIX-GT7-119: the scratch follows the stride (the draw makes it max(stride, 64) bytes a
+    // vertex, the reads use this stride too); 4 attributes was a leftover limit: GT7's hull
+    // shaders of an 80-byte LS stride failed to translate at every race start (37 in 4 s on
+    // Monza), their tessellated draws were never drawn and waited each frame.
+    // FIX-GT7-124: which program, and whether its constants were its draw's (pinned when queued).
+    ASSERT_MSG(num_attrs <= 8, "FIX-227: LS stride {} past 128 bytes a vertex (hs {:#x}, {})",
+               tcs.ls_stride, ctx.info.pgm_hash,
+               ctx.info.pinned_tess_constants ? "constants of its draw"
+                                              : "constants read at translation");
     const Id push_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
     const auto push_word = [&](u32 index) {
         return ctx.OpLoad(ctx.U32[1],
@@ -248,26 +253,10 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
-// FIX-GTS-011: shaders FIX-223 leaves as they were. GT Sport's photo mode filters (Cross
-// Processing and others) need their discarded pixels to stay helpers: ended at once, the filter
-// washed the picture out to purple and white. A change to this list needs a new
-// ShaderBinaryVersionDiscardKill (vk_pipeline_serialization.cpp), or stored shaders keep the old.
-static bool DiscardKills(EmitContext& ctx) {
-    if (!ctx.profile.discard_kills) {
-        return false;
-    }
-    static constexpr std::array<u64, 2> keep{
-        0x0e8aec17, // full-screen pass reading the depth buffer (photo mode filters)
-        0x226b9c89, // text drawn into a 512x512 picture
-    };
-    const u64 hash = ctx.info.pgm_hash & 0xffffffff;
-    return std::ranges::find(keep, hash) == keep.end();
-}
-
 // FIX-223: on AMD, pixels demoted to helpers left junk colours on discard edges
 // (magenta HUD and cockpit lights, green and purple dots on thin geometry).
 void EmitDiscard(EmitContext& ctx) {
-    if (DiscardKills(ctx)) {
+    if (ctx.profile.discard_kills) {
         const Id kill_label{ctx.OpLabel()};
         const Id merge_label{ctx.OpLabel()};
         ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
@@ -286,7 +275,7 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(condition, kill_label, merge_label);
     ctx.AddLabel(kill_label);
-    if (DiscardKills(ctx)) {
+    if (ctx.profile.discard_kills) {
         ctx.OpKill();
     } else {
         ctx.OpDemoteToHelperInvocationEXT();

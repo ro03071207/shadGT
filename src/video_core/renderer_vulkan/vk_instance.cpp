@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
-#include <cstdlib>
-
+#include <array>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
 #include "common/path_util.h"
+#include "common/ryty_config.h"
 #include "common/debug.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -18,8 +18,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_shader_util.h"
-#include "video_core/renderer_vulkan/image_allocation.h"
+#include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
@@ -108,6 +107,8 @@ std::string GetReadableVersion(u32 version) {
 // AMD-300 (SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2): the device reports only what an older Radeon's
 // Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
 // newer card exercises the paths those cards take. It cannot change the hardware's wave size.
+// Nor the vendor ID: on a non-AMD card rdna1|rdna2 keep shader objects on, while a real Radeon
+// draws pipelines by default (FIX-GT7-136); add RYGT_SHADER_OBJECT=0 to mimic one.
 enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
 
 SimulatedGpu GetSimulatedGpu() {
@@ -260,6 +261,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
     CreateDevice();
     CollectPhysicalMemoryInfo();
+    ApplyVideoMemorySetting();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
@@ -306,13 +308,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
-        vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
-        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT,
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
         vk::PhysicalDeviceShaderQuadControlFeaturesKHR,
         vk::PhysicalDeviceShaderObjectFeaturesEXT,
-        vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
-        vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
         vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     features = feature_chain.get().features;
     struct Maintenance11Features {
@@ -429,40 +427,7 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "PERF-210: AMD Anti-Lag {}",
                     anti_lag ? "on" : "not supported by this driver");
     }
-    // BIN-001: pipeline binaries. AMD's Windows driver keeps
-    // nothing of its compiles in a VkPipelineCache, so every launch compiled every pipeline
-    // again; the renderer can store the driver's binaries itself and reuse them. Disabled on
-    // AMD (BIN-003): on an RX 7600 libraries captured or made from binaries no longer fast
-    // linked (0.0 ms on average before, 27-1394 ms with it) and the driver refused many stored
-    // binaries with ErrorOutOfHostMemory.
-    // PERF-376-GTS: opt in only; AMD remains disabled after the observed driver failures.
-    const char* pipeline_binary_env = std::getenv("RYGT_PIPELINE_BINARIES");
-    const bool request_pipeline_binaries = properties.vendorID != 0x1002 &&
-        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0';
-    if (request_pipeline_binaries && maintenance_5) {
-        const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
-                                                        vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
-        pipeline_binary = chain.get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries &&
-                          add_extension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
-        if (pipeline_binary) {
-            const auto props = physical_device.getProperties2<
-                vk::PhysicalDeviceProperties2, vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
-            const auto& p = props.get<vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
-            LOG_WARNING(Render_Vulkan,
-                        "BIN-001: pipeline binaries on (internal cache {}, prefers internal "
-                        "cache {}, precompiled internal cache {}, compressed {})",
-                        bool(p.pipelineBinaryInternalCache),
-                        bool(p.pipelineBinaryPrefersInternalCache),
-                        bool(p.pipelineBinaryPrecompiledInternalCache),
-                        bool(p.pipelineBinaryCompressedData));
-        } else {
-            LOG_WARNING(Render_Vulkan, "BIN-001: pipeline binaries not supported by this driver");
-        }
-    }
-    attachment_feedback_loop =
-        feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&
-        feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>().attachmentFeedbackLoopDynamicState &&
-        add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+    attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =
             add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
@@ -489,17 +454,25 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
-    // SO-001 (RYGT_SHADER_OBJECT=1): VK_EXT_shader_object. Plain pipelines (no tessellation or
-    // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
-    // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
-    // states of extended_dynamic_state3 that those pipelines otherwise fix.
-    // FIX-366-GTS: use pipelines by default; RYGT_SHADER_OBJECT=1 opts into shader objects.
-    // SO-012: a start after a lost device with shader objects on uses pipelines once (the marker
-    // is removed, so the start after that tries shader objects again).
-    const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                             "shader_objects" / "device_lost.txt";
+    // SO-001: VK_EXT_shader_object. Plain pipelines (no tessellation or geometry shader) are drawn
+    // with vertex and fragment shader objects and dynamic state instead of a compiled pipeline: no
+    // driver pipeline compile for them. Needs the dynamic states of extended_dynamic_state3 that
+    // those pipelines otherwise fix.
+    // FIX-GT7-136: off by default on AMD GPUs (crashes reported with shader objects on AMD), on
+    // by default elsewhere. RYGT_SHADER_OBJECT=1 turns them on, =0 off, on any GPU; any other
+    // value keeps the GPU's default.
+    // SO-012: a start that wants shader objects after a lost device with shader objects on uses
+    // pipelines once (the marker is removed, so the next start that wants them tries them again).
+    // A start that doesn't want them leaves the marker for that next one.
+    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
+    const char shader_object_forced = shader_object_env ? shader_object_env[0] : '\0';
+    const bool amd_gpu = properties.vendorID == 0x1002;
+    const bool shader_object_asked =
+        shader_object_forced == '1' || (shader_object_forced != '0' && !amd_gpu);
     bool after_loss = false;
-    {
+    if (shader_object_asked) {
+        const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                                 "shader_objects" / "device_lost.txt";
         std::error_code ec;
         if (std::filesystem::exists(lost_marker, ec)) {
             after_loss = true;
@@ -507,16 +480,13 @@ bool Instance::CreateDevice() {
             LOG_WARNING(Render_Vulkan, "SO-012: the GPU device was lost in the last run with shader "
                                        "objects: this run builds pipelines");
         }
+    } else if (shader_object_forced == '0') {
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (RYGT_SHADER_OBJECT=0)");
+    } else {
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (FIX-GT7-136: off by default on "
+                                   "AMD GPUs, RYGT_SHADER_OBJECT=1 turns them on)");
     }
-    // FIX-374-GTS: pipelines are the default; exact RYGT_SHADER_OBJECT=1 opts in on non-AMD GPUs.
-    // AMD (0x1002) remains hard-disabled after device losses with shader objects on.
-    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
-    constexpr u32 amd_vendor_id = 0x1002;
-    const bool shader_objects_allowed = properties.vendorID != amd_vendor_id && shader_object_env &&
-                                        shader_object_env[0] == '1' && shader_object_env[1] == '\0';
-    LOG_WARNING(Render_Vulkan, "SO-014: shader objects {}; AMD hard-disabled",
-                shader_objects_allowed ? "requested" : "off");
-    if (shader_objects_allowed && !after_loss) {
+    if (shader_object_asked && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -537,8 +507,10 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: available on supported GPUs when opted in, with linked shader objects cached
-        // on disk and only changed state set. RYGT_SHADER_OBJECT_TESS=0 keeps tessellation pipelines.
+        // SO-011: whenever shader objects are on (on AMD only with RYGT_SHADER_OBJECT=1 since
+        // FIX-GT7-136), tessellated pipelines are shader objects too, now that shader objects are
+        // linked, cached on disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them
+        // pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
         // than these headers: enabled by its name, feature structure type and flag value).
@@ -556,15 +528,11 @@ bool Instance::CreateDevice() {
         }
         const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
         shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
-        if (shader_object) {
-            const auto properties = physical_device.getProperties2<
-                vk::PhysicalDeviceProperties2, vk::PhysicalDeviceShaderObjectPropertiesEXT>();
-            shader_object_properties = properties.get<vk::PhysicalDeviceShaderObjectPropertiesEXT>();
-        }
         LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
                     shader_independent_sets ? "yes" : "no (using pipelines)");
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {} ({}); tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
+                    shader_object_forced == '1' ? "RYGT_SHADER_OBJECT=1" : "default on this GPU",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
     }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
@@ -589,16 +557,19 @@ bool Instance::CreateDevice() {
              amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
-    const char* direct_barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-    // AMD-314: AMD's older shader compiler (RX 6000 and older) smeared textures with KHR
-    // barycentrics (AMD-305), and AMD-307 already finds its vertex order, so there the
-    // single-sample path is opt-in (=1); RX 7000 and newer keep it by default.
+    {
+        // FIX-GT7-061: KHR barycentrics are off unless asked for (the launcher's option, off by
+        // default): an RX 6600 XT failed to build shaders with them on.
+        const std::string model{GetModelName()};
+        AmdBarycentricDefault() = false;
+        LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
+                 AmdBarycentricDefault() ? "on" : "off", model,
+                 properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
+    }
     const bool direct_barycentric_candidate =
-        properties.vendorID == 0x1002 &&
-        (direct_barycentric_env ? std::strcmp(direct_barycentric_env, "0") != 0
-                                : !IsAmdLegacyShaderCompiler());
+        properties.vendorID == 0x1002 && SingleSampleBarycentricRequested();
     if (!amd_shader_explicit_vertex_parameter || direct_barycentric_candidate) {
-        // Keep AMD explicit-vertex support for multisampled shaders; the AMD default path
+        // Keep AMD explicit-vertex support for multisampled shaders; the opt-in candidate
         // additionally enables KHR for separately specialized one-sample fragments.
         fragment_shader_barycentric =
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
@@ -612,8 +583,8 @@ bool Instance::CreateDevice() {
                              (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler());
         LOG_INFO(Render_Vulkan, "AMD-307: barycentrics from {}, vertex order check {}",
                  amd_shader_explicit_vertex_parameter ? "VK_AMD_shader_explicit_vertex_parameter"
-                 : fragment_shader_barycentric        ? "VK_KHR_fragment_shader_barycentric"
-                                                      : "none",
+                 : fragment_shader_barycentric       ? "VK_KHR_fragment_shader_barycentric"
+                                                     : "none",
                  vertex_order_check);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
@@ -696,6 +667,18 @@ bool Instance::CreateDevice() {
                          add_extension(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
     LOG_INFO(Render_Vulkan, "AMD-VRAM-002: memory overallocation allowed: {}", amd_overallocation);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+    // DIAG-243: RYGT_DEVICE_FAULT=1 enables VK_EXT_device_fault, so a lost device reports the
+    // faulting address and the driver's description.
+    if (const char* env = std::getenv("RYGT_DEVICE_FAULT"); env && env[0] == '1') {
+        const auto fault_chain =
+            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceFaultFeaturesEXT>();
+        if (fault_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault) {
+            device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-243: VK_EXT_device_fault {}",
+                    device_fault ? "enabled" : "not available");
+    }
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
@@ -732,16 +715,15 @@ bool Instance::CreateDevice() {
                                  : has("Radeon RX 6") ? "RDNA2 (RX 6000)"
                                  : has("Radeon RX 55") || has("Radeon RX 56") || has("Radeon RX 57")
                                      ? "RDNA1 (RX 5000)"
-                                 : has("Vega")                              ? "GCN 5 (Vega)"
+                                 : has("Vega") ? "GCN 5 (Vega)"
                                  : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
                                                                             : "other Radeon";
         const bool legacy = IsAmdLegacyShaderCompiler();
         LOG_INFO(Render_Vulkan,
                  "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
                  "order check {}, KHR barycentrics {}",
-                 generation, GetDriverVersionName(), driver_info,
-                 legacy ? "older (non-LLPC)" : "LLPC", quad_control, vertex_order_check,
-                 fragment_shader_barycentric);
+                 generation, GetDriverVersionName(), driver_info, legacy ? "older (non-LLPC)" : "LLPC",
+                 quad_control, vertex_order_check, fragment_shader_barycentric);
         if (legacy && !quad_control && !std::getenv("SHADGT_QUAD_CONTROL")) {
             LOG_WARNING(Render_Vulkan,
                         "AMD-316: this driver has no VK_KHR_shader_quad_control; textures in "
@@ -834,6 +816,9 @@ bool Instance::CreateDevice() {
                 .dualSrcBlend = features.dualSrcBlend,
                 .logicOp = features.logicOp,
                 .multiDrawIndirect = features.multiDrawIndirect,
+                // NAT-161: GT7's indirect draws (their arguments written by compute shaders)
+                // may start at an instance other than 0, which the shaders read as BaseInstance.
+                .drawIndirectFirstInstance = features.drawIndirectFirstInstance,
                 .depthClamp = features.depthClamp,
                 .depthBiasClamp = features.depthBiasClamp,
                 .fillModeNonSolid = features.fillModeNonSolid,
@@ -907,8 +892,8 @@ bool Instance::CreateDevice() {
             .extendedDynamicState3ColorWriteMask =
                 dynamic_state_3_features.extendedDynamicState3ColorWriteMask,
             .extendedDynamicState3DepthClipEnable = shader_object,
-            .extendedDynamicState3ProvokingVertexMode = shader_object,
             .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
+            .extendedDynamicState3ProvokingVertexMode = shader_object,
         },
         vk::PhysicalDeviceShaderObjectFeaturesEXT{
             .shaderObject = true, // SO-001
@@ -981,23 +966,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
             .graphicsPipelineLibrary = true,
         },
-        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
-            .memoryPriority = pageable_memory,
-        },
-        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
-            .pageableDeviceLocalMemory = pageable_memory,
-        },
-        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT{
-            .mutableDescriptorType = true, // XESS-200
-        },
-        vk::PhysicalDeviceFaultFeaturesEXT{
-            .deviceFault = true, // DIAG-206
-        },
         vk::PhysicalDeviceAntiLagFeaturesAMD{
             .antiLag = true, // PERF-210
-        },
-        vk::PhysicalDevicePipelineBinaryFeaturesKHR{
-            .pipelineBinaries = true, // BIN-001
         },
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
             .shaderMaximalReconvergence = true, // AMD-306
@@ -1005,32 +975,13 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderQuadControlFeaturesKHR{
             .shaderQuadControl = true, // AMD-306
         },
-        vk::DeviceMemoryOverallocationCreateInfoAMD{
-            .overallocationBehavior = vk::MemoryOverallocationBehaviorAMD::eAllowed, // AMD-VRAM-002
-        },
     };
-    if (!amd_overallocation) {
-        device_chain.unlink<vk::DeviceMemoryOverallocationCreateInfoAMD>();
-    }
     if (!quad_control) {
         device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
         device_chain.unlink<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
     }
-    if (!device_fault) {
-        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
-    }
     if (!anti_lag) {
         device_chain.unlink<vk::PhysicalDeviceAntiLagFeaturesAMD>();
-    }
-    if (!pipeline_binary) {
-        device_chain.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
-    }
-    if (!xess_mutable_descriptor) {
-        device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
-    }
-    if (!pageable_memory) {
-        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
-        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
     }
     if (!graphics_pipeline_library) {
         device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
@@ -1089,6 +1040,13 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
+    // DIAG-243: the fault feature joins the chain when its extension is on.
+    vk::PhysicalDeviceFaultFeaturesEXT fault_features{.deviceFault = true};
+    if (device_fault) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        fault_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &fault_features;
+    }
     if (shader_independent_sets) {
         auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
         maintenance11_features.pNext = const_cast<void*>(create_info.pNext);
@@ -1290,6 +1248,38 @@ void Instance::CollectPhysicalMemoryInfo() {
         static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
 }
 
+// NAT-VRAM-001: the launcher's video memory setting (GPU.vram_budget_mb, 0 = Auto) or
+// RYGT_VRAM_BUDGET_MB caps the budget the texture cache's garbage collector plans with, so it
+// frees cached images the game hasn't used lately once the process uses more than the setting.
+// Auto keeps the driver-reported budget (VK_EXT_memory_budget) unchanged.
+u64 Instance::VideoMemorySettingBytes() {
+    static const u64 bytes = [] {
+        if (const char* env = std::getenv("RYGT_VRAM_BUDGET_MB"); env && *env) {
+            return u64{std::strtoull(env, nullptr, 10)} << 20;
+        }
+        if (const auto value = Common::RytyGameConfigValue("vram_budget_mb")) {
+            return u64{std::strtoull(value->c_str(), nullptr, 10)} << 20;
+        }
+        return u64{0};
+    }();
+    return bytes;
+}
+
+void Instance::ApplyVideoMemorySetting() {
+    const u64 driver_budget = total_memory_budget;
+    const u64 setting = VideoMemorySettingBytes();
+    if (setting != 0) {
+        // Not below 1 GB: the renderer's own targets and buffers need about that much.
+        total_memory_budget = std::min(driver_budget, std::max<u64>(setting, 1_GB));
+    }
+    LOG_WARNING(Render_Vulkan,
+                "NAT-VRAM-001: video memory budget {} MB ({}; driver budget {} MB, memory budget "
+                "extension {})",
+                total_memory_budget >> 20,
+                setting != 0 ? fmt::format("setting {} MB", setting >> 20) : std::string{"Auto"},
+                driver_budget >> 20, supports_memory_budget ? "on" : "off");
+}
+
 void Instance::CollectImageFormatInfo() {
     // Check for block texel view support using basic image format info.
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -1407,88 +1397,124 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
     return format;
 }
 
-void Instance::LogDeviceFault() const {
-    // DIAG-206: once, after the device was lost.
-    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
-    if (logged.test_and_set()) {
+namespace {
+// DIAG-243: a ring of the last draws recorded (pipeline key hash, info word).
+struct FaultDraw {
+    std::atomic<u64> hash{};
+    std::atomic<u32> info{};
+    std::atomic<u64> serial{};
+};
+constexpr u32 FaultRingSize = 64;
+std::array<FaultDraw, FaultRingSize> g_fault_draws;
+std::atomic<u64> g_fault_serial{};
+} // namespace
+
+void NoteDrawForFault(u64 pipeline_hash, u32 info) {
+    const u64 serial = g_fault_serial.fetch_add(1, std::memory_order_relaxed);
+    auto& entry = g_fault_draws[serial % FaultRingSize];
+    entry.hash.store(pipeline_hash, std::memory_order_relaxed);
+    entry.info.store(info, std::memory_order_relaxed);
+    entry.serial.store(serial + 1, std::memory_order_release);
+}
+
+void Instance::ReportDeviceLost() const {
+    static std::atomic<bool> reported{};
+    if (reported.exchange(true)) {
         return;
     }
+    LOG_CRITICAL(Render_Vulkan, "DIAG-243: the GPU device was lost");
     if (shader_object) {
+        // SO-012: the next start uses pipelines once.
         std::error_code ec;
-        const auto folder = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects";
+        const auto folder =
+            Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects";
         std::filesystem::create_directories(folder, ec);
         if (std::FILE* file = std::fopen((folder / "device_lost.txt").string().c_str(), "w")) {
             std::fputs("GPU device lost with shader objects on; next start uses pipelines\n", file);
             std::fclose(file);
         }
     }
-#ifdef RYTY_GPU
-    Native::GpuCheckpoints::Log(static_cast<VkQueue>(graphics_queue));
-#endif
-    if (!device_fault) return;
-    const auto get_fault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
-        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(static_cast<VkDevice>(*device),
-                                                          "vkGetDeviceFaultInfoEXT"));
-    if (!get_fault) {
-        return;
+    if (device_fault && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
+        const VkDevice dev = static_cast<VkDevice>(*device);
+        VkDeviceFaultCountsEXT counts{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(dev, &counts, nullptr);
+        std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+        VkDeviceFaultInfoEXT info{.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        info.pAddressInfos = addresses.data();
+        info.pVendorInfos = vendors.data();
+        counts.vendorBinarySize = 0; // no vendor binary dump
+        const VkResult result =
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(dev, &counts, &info);
+        LOG_CRITICAL(Render_Vulkan, "DIAG-243: device fault ({}): {}; {} addresses, {} vendor infos",
+                     static_cast<int>(result), info.description, counts.addressInfoCount,
+                     counts.vendorInfoCount);
+        // VkDeviceFaultAddressTypeEXT.
+        static constexpr const char* types[] = {"none", "read invalid", "write invalid",
+                                                "execute invalid",
+                                                "instruction pointer (a running wave)",
+                                                "instruction pointer invalid",
+                                                "instruction pointer fault"};
+        for (u32 i = 0; i < counts.addressInfoCount; ++i) {
+            const auto& a = addresses[i];
+            const u32 type = static_cast<u32>(a.addressType);
+            LOG_CRITICAL(Render_Vulkan, "DIAG-243:   address {:#x} (+-{:#x}): {}",
+                         a.reportedAddress, a.addressPrecision,
+                         type < std::size(types) ? types[type] : "?");
+        }
+        for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
+            const auto& v = vendors[i];
+            LOG_CRITICAL(Render_Vulkan, "DIAG-243:   vendor: {} (code {:#x}, data {:#x})",
+                         v.description, v.vendorFaultCode, v.vendorFaultData);
+        }
     }
-    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-    if (get_fault(static_cast<VkDevice>(*device), &counts, nullptr) != VK_SUCCESS &&
-        counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
-        LOG_CRITICAL(Render_Vulkan, "DIAG-206: the driver has no fault report");
-        return;
-    }
-    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
-    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
-    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
-    info.pAddressInfos = addresses.data();
-    info.pVendorInfos = vendor.data();
-    counts.vendorBinarySize = 0;
-    get_fault(static_cast<VkDevice>(*device), &counts, &info);
-    LOG_CRITICAL(Render_Vulkan, "DIAG-206: device fault: {}", info.description);
-    for (const auto& address : addresses) {
-        LOG_CRITICAL(Render_Vulkan, "DIAG-206: address type {} at {:#x} (precision {:#x})",
-                     int(address.addressType), address.reportedAddress,
-                     address.addressPrecision);
-    }
-    for (const auto& entry : vendor) {
-        LOG_CRITICAL(Render_Vulkan, "DIAG-206: vendor fault {:#x} data {:#x}: {}",
-                     entry.vendorFaultCode, entry.vendorFaultData, entry.description);
+    // The draws recorded last, newest first (the GPU was somewhere among them or before).
+    const u64 newest = g_fault_serial.load(std::memory_order_acquire);
+    for (u32 back = 0; back < FaultRingSize && back < newest; ++back) {
+        const u64 serial = newest - 1 - back;
+        const auto& entry = g_fault_draws[serial % FaultRingSize];
+        if (entry.serial.load(std::memory_order_acquire) != serial + 1) {
+            continue;
+        }
+        const u32 info = entry.info.load(std::memory_order_relaxed);
+        LOG_CRITICAL(Render_Vulkan,
+                     "DIAG-243:   draw -{}: pipeline {:#018x}, tessellated {}, LDS emulation {}",
+                     back, entry.hash.load(std::memory_order_relaxed), (info >> 8) & 1,
+                     info & 0xff);
     }
 }
 
+static void SendAntiLagStage(vk::Device device, vk::AntiLagStageAMD stage, u64 frame) {
+    const vk::AntiLagPresentationInfoAMD info{
+        .stage = stage,
+        .frameIndex = frame,
+    };
+    device.antiLagUpdateAMD(vk::AntiLagDataAMD{
+        .mode = vk::AntiLagModeAMD::eOn,
+        .maxFPS = 0,
+        .pPresentationInfo = &info,
+    });
+}
+
 // PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
-// the game there and start its next frame later; the present stage closes that frame.
+// the game there and start its next frame later. The flip carries the frame's index to its
+// present, which closes that frame; repeats of a frame and flips at end of pipe carry 0.
 u64 Instance::AntiLagInput() const {
     if (!anti_lag) {
         return 0;
     }
     std::scoped_lock lock{anti_lag_mutex};
     ++anti_lag_frame;
-    const vk::AntiLagPresentationInfoAMD info{
-        .stage = vk::AntiLagStageAMD::eInput,
-        .frameIndex = anti_lag_frame,
-    };
-    device->antiLagUpdateAMD(vk::AntiLagDataAMD{
-        .mode = vk::AntiLagModeAMD::eOn,
-        .maxFPS = 0,
-        .pPresentationInfo = &info,
-    });
+    SendAntiLagStage(*device, vk::AntiLagStageAMD::eInput, anti_lag_frame);
     return anti_lag_frame;
 }
 
 void Instance::AntiLagPresent(u64 frame) const {
-    if (!anti_lag || frame == 0) return;
+    if (!anti_lag || frame == 0) {
+        return;
+    }
     std::scoped_lock lock{anti_lag_mutex};
-    const vk::AntiLagPresentationInfoAMD info{
-        .stage = vk::AntiLagStageAMD::ePresent,
-        .frameIndex = frame,
-    };
-    device->antiLagUpdateAMD(vk::AntiLagDataAMD{
-        .mode = vk::AntiLagModeAMD::eOn,
-        .maxFPS = 0,
-        .pPresentationInfo = &info,
-    });
+    SendAntiLagStage(*device, vk::AntiLagStageAMD::ePresent, frame);
 }
 
 } // namespace Vulkan

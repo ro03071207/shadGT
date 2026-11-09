@@ -6,7 +6,9 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -56,12 +58,19 @@ const bool g_compare = [] {
 constexpr bool g_compare = false;
 #endif
 // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
-// PERF-316: on whenever the native renderer is (launcher or RYGT_NATIVE); RYGT_NATIVE_PREPARE=0
-// turns it off. Decided at first use: the game's settings are not readable at load time.
-bool PrepareOn() {
-    static const bool on = Vulkan::NativeRenderer::PrepareEnabled();
-    return on;
-}
+// FIX-229: not while FIX-227's hull-shader LDS emulation is on (RYGT_TESS_LDS_EMULATION, on by
+// default) unless RYGT_NATIVE_PREPARE_FORCE=1: with eight prepare workers two of three Alsace
+// runs lost the GPU device (NativeRenderer::PrepareEnabled logs it).
+const bool g_prepare = [] {
+    const char* env = std::getenv("RYGT_NATIVE_PREPARE");
+    const char* native = std::getenv("RYGT_NATIVE");
+    const char* lds = std::getenv("RYGT_TESS_LDS_EMULATION");
+    const char* force = std::getenv("RYGT_NATIVE_PREPARE_FORCE");
+    const bool lds_on = !(lds && lds[0] == '0');
+    const bool forced = force && force[0] == '1';
+    return env && env[0] == '1' && native && native[0] == '1' && (!lds_on || forced);
+}();
+const bool g_enabled = g_compare || g_prepare;
 
 // The state compared at each draw (dword indices into Regs::reg_array): the graphics stages' SH
 // registers (programs, user data; compute registers from 0x2E00 are kept apart by the command
@@ -434,7 +443,7 @@ struct RegisterDiff {
 std::unordered_map<u32, RegisterDiff> g_register_diffs; // sampled draws only
 std::unordered_map<u32, RegisterDiff> g_relevant_diffs; // sampled draws, registers that matter
 
-constexpr u32 kContextDcb = 0x780; // a PGL context's Gnm DrawCommandBuffer
+u32 kContextDcb = 0x780; // a PGL context's Gnm DrawCommandBuffer (GT7: 0x778, SetPglContextDcb)
 
 const u32* DcbBegin(const u8* dcb) {
     return *reinterpret_cast<const u32* const*>(dcb); // Gnm CommandBuffer::m_beginptr
@@ -473,8 +482,18 @@ thread_local bool t_has_ended = false;
 thread_local std::vector<std::unique_ptr<State>> t_free_states; // large: reused
 thread_local u32 t_sample = 0;
 
+// GT7-PREP: states the prepare workers finished with (they are large: reused, not freed).
+std::mutex g_pool_mutex;
+std::vector<std::unique_ptr<State>> g_state_pool;
+
 std::unique_ptr<State> TakeState() {
     if (t_free_states.empty()) {
+        std::scoped_lock lock{g_pool_mutex};
+        if (!g_state_pool.empty()) {
+            std::unique_ptr<State> state = std::move(g_state_pool.back());
+            g_state_pool.pop_back();
+            return state;
+        }
         return std::make_unique<State>();
     }
     std::unique_ptr<State> state = std::move(t_free_states.back());
@@ -652,12 +671,10 @@ private:
 
 // Walks a job's commands up to `until` like the command processor does (NAT-004), recording a
 // snapshot of the state at each draw.
-void WalkJobTo(Job& job, const u32* until) {
-#ifndef NDEBUG
+void WalkJobTo(Job& job, const u32* until, std::optional<u32> epoch = std::nullopt) {
     const auto start = std::chrono::steady_clock::now();
-#endif
-    SnapshotVisitor visitor{g_epoch.load(std::memory_order_relaxed), job.from_parent,
-                            job.state.get()};
+    SnapshotVisitor visitor{epoch ? *epoch : g_epoch.load(std::memory_order_relaxed),
+                            job.from_parent, job.state.get()};
     job.cursor.WalkTo(until, job.state->regs, job.extents, visitor, job.walk);
 #ifndef NDEBUG
     job.walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -887,6 +904,10 @@ bool ShadowEnabled() {
     return g_compare || PrepareOn();
 }
 
+void SetPglContextDcb(u32 offset) {
+    kContextDcb = offset;
+}
+
 bool ShadowComparing() {
     return g_compare;
 }
@@ -1067,6 +1088,73 @@ void ShadowJobEnd(const u8* current_context) {
     g_open_jobs.erase(t_ended.dcb);
 }
 
+namespace {
+
+// GT7-PREP: the walk of an ended job (and the draws it prepares) runs on the renderer's own
+// prepare workers instead of the game's job thread, which is on the game's critical path: there
+// the walks took about as much off the frame as the prepared draws saved the recorder.
+// RYGT_NATIVE_PREPARE_WORKERS=<n> (default 4); 0 walks on the job's thread, as before. A job
+// still queued a submission after it was queued is dropped: its commands may be reused by then
+// (the recorder then does its draws itself).
+u32 PrepareWorkers() {
+    static const u32 workers = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PREPARE_WORKERS");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 4u;
+    }();
+    return workers;
+}
+
+struct QueuedJob {
+    Job job;
+    u32 epoch;
+};
+std::mutex g_queue_mutex;
+std::condition_variable g_queue_cv;
+std::deque<QueuedJob> g_queue;
+std::atomic<u64> g_queued{0}, g_dropped_late{0}, g_max_queue{0};
+
+void GiveBack(std::unique_ptr<State> state) {
+    if (state) {
+        std::scoped_lock lock{g_pool_mutex};
+        g_state_pool.push_back(std::move(state));
+    }
+}
+
+void PrepareWorker(u32 index) {
+    const std::wstring name = L"shadGT:Prepare" + std::to_wstring(index);
+    SetThreadDescription(GetCurrentThread(), name.c_str());
+    auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (true) {
+        QueuedJob item;
+        {
+            std::unique_lock lock{g_queue_mutex};
+            g_queue_cv.wait(lock, [] { return !g_queue.empty(); });
+            item = std::move(g_queue.front());
+            g_queue.pop_front();
+        }
+        if (g_epoch.load(std::memory_order_relaxed) - item.epoch > 1) {
+            ++g_dropped_late;
+            GiveBack(std::move(item.job.state));
+            continue;
+        }
+        WalkJobTo(item.job, item.job.end, item.epoch); // the submission it was recorded for
+        FinishJob(item.job);
+        // FinishJob kept the state on this thread: hand it back to the job threads.
+        while (!t_free_states.empty()) {
+            GiveBack(std::move(t_free_states.back()));
+            t_free_states.pop_back();
+        }
+        if (index == 0 && std::chrono::steady_clock::now() >= next_report) {
+            next_report += std::chrono::seconds(10);
+            LOG_INFO(Lib_GnmDriver, "GT7-PREP workers (10 s): {} jobs queued, {} dropped as late, "
+                     "most queued {}", g_queued.exchange(0), g_dropped_late.exchange(0),
+                     g_max_queue.exchange(0));
+        }
+    }
+}
+
+} // namespace
+
 void ShadowJobDecode() {
     if (!t_has_ended) {
         return;
@@ -1074,6 +1162,27 @@ void ShadowJobDecode() {
     t_has_ended = false;
     if (!t_ended.state) {
         return; // no start state
+    }
+    if (const u32 workers = PrepareWorkers(); workers != 0 && g_prepare && !g_compare) {
+        static std::once_flag started;
+        std::call_once(started, [workers] {
+            for (u32 i = 0; i < workers; ++i) {
+                std::thread{PrepareWorker, i}.detach();
+            }
+        });
+        size_t queued;
+        {
+            std::scoped_lock lock{g_queue_mutex};
+            g_queue.push_back({std::move(t_ended), g_epoch.load(std::memory_order_relaxed)});
+            queued = g_queue.size();
+        }
+        g_queue_cv.notify_one();
+        ++g_queued;
+        u64 most = g_max_queue.load(std::memory_order_relaxed);
+        while (queued > most && !g_max_queue.compare_exchange_weak(most, queued)) {
+        }
+        t_ended = Job{};
+        return;
     }
     WalkJobTo(t_ended, t_ended.end);
     FinishJob(t_ended);

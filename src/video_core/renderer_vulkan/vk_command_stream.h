@@ -246,8 +246,12 @@ public:
     explicit operator bool() const noexcept {
         return ring != nullptr || direct;
     }
+
+    /// SO-001: commands recorded by a function of the command buffer (shader object binds).
     template <typename F>
-    void Run(F&& fn) const { Call(std::forward<F>(fn)); }
+    void Run(F&& fn) const {
+        Call(std::forward<F>(fn));
+    }
 
     void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
         Call([=](vk::CommandBuffer cmd) { cmd.bindPipeline(bind_point, pipeline); });
@@ -330,18 +334,6 @@ public:
     void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, u32 query) const {
         Call([=](vk::CommandBuffer cmd) { cmd.writeTimestamp2(stage, pool, query); });
     }
-
-    void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, u32 query) const {
-        Call([=](vk::CommandBuffer cmd) { cmd.writeTimestamp(stage, pool, query); });
-    }
-
-    void blitImage(vk::Image src, vk::ImageLayout src_layout, vk::Image dst,
-                   vk::ImageLayout dst_layout, vk::ImageBlit region, vk::Filter filter) const {
-        Call([=](vk::CommandBuffer cmd) { cmd.blitImage(src, src_layout, dst, dst_layout, region, filter); });
-    }
-
-    template <typename F>
-    void Invoke(F&& fn) const { Call(std::forward<F>(fn)); }
 
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
         Call([=](vk::CommandBuffer cmd) { cmd.dispatchIndirect(buffer, offset); });

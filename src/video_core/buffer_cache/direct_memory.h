@@ -58,6 +58,10 @@ public:
     /// Imports the views covering [address, address + size) not imported yet. True when every
     /// page of the range is now mapped for the GPU.
     bool EnsureImported(VAddr address, u64 size);
+    /// FIX-205: views dropped at unmaps from now on are freed only after the work of the next
+    /// list ReleaseHeldAfter is told of (the native renderer's lists).
+    static void HoldReleasesForSplice();
+    static void ReleaseHeldAfter(u64 tick);
 
     /// Best-effort worker warm-up: never waits for the view mutex, imports at most
     /// eight small views per visit, and does not run pending-release callbacks.
@@ -103,6 +107,12 @@ public:
     /// released once the GPU has finished the work recorded so far.
     void OnUnmap(VAddr address, u64 size);
 
+    /// FIX-GT7-077: Ryty mapped [address, address + size) (it reports after it did). Whether views
+    /// of the memory mapped there before are still in the page table: a view imported between
+    /// Ryty's unmap report and its unmap is an alias of the old pages, which the game then gives
+    /// to other data. Bases that failed to import there may import again.
+    bool ViewsOver(VAddr address, u64 size);
+
     /// D4: the command processor rewrites this range while queued draws may still read it (CE
     /// dumps, WriteData): its buffers keep the copy path, which snapshots at bind time.
     void MarkVolatile(VAddr address, u64 size);
@@ -132,8 +142,9 @@ private:
         std::shared_ptr<ImportedViewLease> lease;
         std::shared_ptr<Buffer> wrapper; // D6: owns `buffer`; bound as vertex/index buffer
     };
-    // PERF-GT7-022: at most two allocation-relative pieces per import,
-    // trimmed around already imported views; preserves non-overlap.
+    /// Imports the view holding `address`: PERF-GT7-022: the 256 MiB piece of its allocation
+    /// that holds it, or up to `want_end` (512 MiB at most) when the pieces up to there are not
+    /// imported yet, so a range asked for in one go stays in one view.
     bool ImportView(VAddr address, VAddr want_end);
     void MapPages(VAddr begin, VAddr end, vk::DeviceAddress device_address);
     void UnmapPages(VAddr begin, VAddr end);

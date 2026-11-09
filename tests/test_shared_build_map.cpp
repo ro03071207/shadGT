@@ -13,17 +13,6 @@
 
 using Vulkan::SharedBuildMap;
 
-TEST(SharedBuildMap, InstanceDrainDestroysEachValueAndDoesNotCrossCaches) {
-    SharedBuildMap<int> first, second;
-    first.Insert(42, 7);
-    second.Insert(42, 9);
-    int destroyed = 0;
-    first.Drain([&](int value) { destroyed += value; });
-    EXPECT_EQ(destroyed, 7);
-    EXPECT_EQ(first.Find(42), 0);
-    EXPECT_EQ(second.Find(42), 9);
-}
-
 TEST(SharedBuildMap, BuildsOnceThenReuses) {
     SharedBuildMap<int> map;
     int builds = 0;

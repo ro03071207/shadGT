@@ -11,16 +11,14 @@
 
 namespace Libraries::VideoOut {
 
-constexpr bool FastFlipsEnabled(const char* env, std::optional<bool> config,
-                                bool native_renderer, bool frame_generation) {
-    if (env && *env) return env[0] == '1';
-    if (config) return *config;
+/// Present between vblank ticks by default on the native renderer, without frame generation.
+/// Preserve the existing explicit opt-in, and allow =0 to restore flip-on-vblank pacing.
+constexpr bool FastFlipsEnabled(const char* override_value, bool native_renderer,
+                                bool frame_generation) {
+    if (override_value && *override_value) {
+        return override_value[0] == '1';
+    }
     return native_renderer && !frame_generation;
-}
-
-constexpr std::chrono::nanoseconds FastFlipInterval(std::chrono::nanoseconds vblank, int rate) {
-    return std::max(std::chrono::nanoseconds::zero(),
-                    vblank * (rate + 1) - std::chrono::milliseconds{1});
 }
 
 /// PERF-075: the flip rate the presenter honours with a frame-rate lock. A flip rate of N lets a

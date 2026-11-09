@@ -4,14 +4,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#include <algorithm>
 #include <atomic>
 #include <cwctype>
+#include <ctime>
 #include <map>
 #include <mutex>
-#include <span>
 #include <unordered_map>
-#include <algorithm>
-#include <ctime>
 #include <vector>
 #include <string>
 #include <thread>
@@ -123,78 +122,12 @@ BOOL CallSetThreadSelectedCpuSets(HANDLE thread, const ULONG* ids, ULONG count) 
     return proc && proc(thread, ids, count);
 }
 
-// Fail closed if the API is unavailable or the caller already selected CPUs.
-bool HasThreadSelection(HANDLE thread) {
-    using Fn = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-    static const auto get = KernelProc<Fn>("GetThreadSelectedCpuSets");
-    if (!get) return true;
-    ULONG needed = 0;
-    const BOOL ok = get(thread, nullptr, 0, &needed);
-    return needed != 0 || (!ok && GetLastError() != ERROR_INSUFFICIENT_BUFFER);
-}
-bool ReadThreadCpuSelection(HANDLE thread, std::vector<ULONG>& ids) {
-    using Fn = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-    static const auto get = KernelProc<Fn>("GetThreadSelectedCpuSets");
-    if (!get) return false;
-    ULONG needed = 0;
-    const BOOL ok = get(thread, nullptr, 0, &needed);
-    if (!ok && GetLastError() != ERROR_INSUFFICIENT_BUFFER) return false;
-    ids.resize(needed);
-    return !needed || get(thread, ids.data(), needed, &needed);
-}
-bool ReadProcessCpuSelection(std::vector<ULONG>& ids) {
-    using Fn = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
-    static const auto get = KernelProc<Fn>("GetProcessDefaultCpuSets");
-    if (!get) return false;
-    ULONG needed = 0;
-    const BOOL ok = get(GetCurrentProcess(), nullptr, 0, &needed);
-    if (!ok && GetLastError() != ERROR_INSUFFICIENT_BUFFER) return false;
-    ids.resize(needed);
-    return !needed || get(GetCurrentProcess(), ids.data(), needed, &needed);
-}
-std::mutex owner_policy_mutex;
-std::vector<ULONG> owner_policy_default;
-bool ProcessPolicyStillAllowed() {
-    std::scoped_lock lock{owner_policy_mutex};
-    DWORD_PTR process_mask = 0, system_mask = 0;
-    std::vector<ULONG> current;
-    return GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) &&
-           process_mask == system_mask && ReadProcessCpuSelection(current) &&
-           std::ranges::is_permutation(current, owner_policy_default);
-}
-bool CpuSetAvailable(const SYSTEM_CPU_SET_INFORMATION& entry) {
-    return entry.Type == CpuSetInformation &&
-           (!entry.CpuSet.Allocated || entry.CpuSet.AllocatedToTargetProcess);
-}
-bool CpuSetsStillAvailable(std::span<const ULONG> ids) {
-    ULONG bytes = 0;
-    CallGetSystemCpuSetInformation(nullptr, 0, &bytes);
-    if (!bytes) return false;
-    std::vector<u8> data(bytes);
-    if (!CallGetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(data.data()),
-                                        bytes, &bytes)) return false;
-    for (const ULONG id : ids) {
-        bool found = false;
-        for (ULONG offset = 0; offset < bytes;) {
-            const auto& entry = *reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(data.data() + offset);
-            if (!entry.Size || entry.Size > bytes - offset) return false;
-            if (CpuSetAvailable(entry) && entry.CpuSet.Id == id) found = true;
-            offset += entry.Size;
-        }
-        if (!found) return false;
-    }
-    return true;
-}
-thread_local bool compile_selection_applied = false;
-thread_local std::vector<ULONG> compile_selection;
-
 // PERF-088: the CPU sets and their efficiency classes (the highest class is the fast cores).
 struct CoreClasses {
     std::vector<ULONG> fast_ids;
     std::vector<ULONG> slow_ids;
     std::vector<s8> fast_by_index; // by group * 64 + logical processor index: 1 fast, 0 slow
     bool hybrid = false;
-    bool external_restrictions = false;
     std::vector<ULONG> compile_ids; // PERF-GT7-024: one kind of core: the compile cores
     std::vector<ULONG> game_ids;    // PERF-GT7-032: and the other cores
     std::vector<std::vector<ULONG>> game_cores; // PERF-GT7-048: the same, by physical core
@@ -279,7 +212,7 @@ const CoreClasses& GetCoreClasses() {
             for (ULONG offset = 0; offset < length;) {
                 const auto& entry =
                     *reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
-                if (CpuSetAvailable(entry)) {
+                if (entry.Type == CpuSetInformation) {
                     cores[u32(entry.CpuSet.Group) << 8 | entry.CpuSet.CoreIndex].push_back(
                         entry.CpuSet.Id);
                 }
@@ -347,36 +280,35 @@ void PreferEfficiencyCores() {
 
 void PreferCompileCores() {
     const auto& classes = GetCoreClasses();
-    if (classes.external_restrictions || !ProcessPolicyStillAllowed()) return;
-    if (!compile_selection_applied && HasThreadSelection(GetCurrentThread())) return;
     if (classes.hybrid) {
-        const char* env = std::getenv("SHADGT_BUILD_ON_SLOW_CORES");
-        if (!(env && env[0] == '0') && !classes.slow_ids.empty() && CpuSetsStillAvailable(classes.slow_ids)) {
-            compile_selection_applied = CallSetThreadSelectedCpuSets(GetCurrentThread(), classes.slow_ids.data(),
-                static_cast<ULONG>(classes.slow_ids.size())) != FALSE;
-            if (compile_selection_applied) compile_selection = classes.slow_ids;
-        }
+        PreferEfficiencyCores();
         return;
     }
-    if (CompileCoresOn() && !classes.compile_ids.empty() && CpuSetsStillAvailable(classes.compile_ids)) {
-        compile_selection_applied = CallSetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
-                                  static_cast<ULONG>(classes.compile_ids.size())) != FALSE;
-        if (compile_selection_applied) compile_selection = classes.compile_ids;
+    if (CompileCoresOn() && !classes.compile_ids.empty()) {
+        CallSetThreadSelectedCpuSets(GetCurrentThread(), classes.compile_ids.data(),
+                                 static_cast<ULONG>(classes.compile_ids.size()));
     }
 }
 
-void ReleaseCompileCores() {
-    if (!compile_selection_applied) return;
-    std::vector<ULONG> current;
-    if (ReadThreadCpuSelection(GetCurrentThread(), current) &&
-        std::ranges::is_permutation(current, compile_selection))
-        CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
-    compile_selection_applied = false;
-    compile_selection.clear();
+// FIX-GT7-107: "every core" for compile work. With a core owner (PERF-GT7-048) the process
+// default CPU set is the game's cores but the owners' (compile cores excluded): a thread without
+// a set of its own runs there only, so compiles "widened" for a waiting draw, a catch-up or a
+// backlog left the 3 compile cores for the game's 4 (a first race filled in at ~3.9 pipelines a
+// second either way, ~7 with RYGT_COMPILE_CORES=0). Every core but the owners' then, explicitly.
+std::mutex g_wide_mutex;
+std::vector<ULONG> g_wide_ids; ///< empty: no owner, the process default is every core
+
+void SetWideCores(HANDLE thread) {
+    std::scoped_lock lk{g_wide_mutex};
+    if (g_wide_ids.empty()) {
+        CallSetThreadSelectedCpuSets(thread, nullptr, 0);
+    } else {
+        CallSetThreadSelectedCpuSets(thread, g_wide_ids.data(), ULONG(g_wide_ids.size()));
+    }
 }
 
 void AllowAllCores() {
-    CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+    SetWideCores(GetCurrentThread());
 }
 
 // PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none):
@@ -395,37 +327,13 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
         return;
     }
     thread_local int applied = -1;
-    thread_local std::vector<ULONG> owned_process_default;
-    thread_local std::vector<ULONG> owned_thread_selection;
-    const auto release_thread_if_owned = [&] {
-        std::vector<ULONG> selected;
-        if (ReadThreadCpuSelection(GetCurrentThread(), selected) &&
-            std::ranges::is_permutation(selected, owned_thread_selection))
-            CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
-    };
     const int state = wanted ? 1 : 0;
     if (applied == state) {
         return;
     }
-    if (!wanted && applied != 1) return;
+    applied = state;
     const auto& classes = GetCoreClasses();
-    if (classes.external_restrictions) return;
-    std::scoped_lock owner_lock{owner_policy_mutex};
-    DWORD_PTR process_mask = 0, system_mask = 0;
-    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) || process_mask != system_mask) {
-        if (!wanted) release_thread_if_owned();
-        return;
-    }
-    std::vector<ULONG> current_default;
-    if (!ReadProcessCpuSelection(current_default) ||
-        (wanted ? !current_default.empty() : !std::ranges::is_permutation(current_default, owned_process_default))) {
-        if (!wanted) release_thread_if_owned();
-        return;
-    }
-    if (wanted && HasThreadSelection(GetCurrentThread())) return;
     const size_t owners = std::popcount(mask);
-    // Multi-owner release needs coordinated process-wide state; fail closed.
-    if (owners != 1) return;
     // Without compile cores, nothing is kept from the game's threads but the owners' cores.
     const auto& usable = CompileCoresOn() ? classes.game_cores : classes.all_cores;
     if (classes.hybrid || usable.size() < owners + 2) {
@@ -436,14 +344,11 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
         index += (mask >> i) & 1;
     }
     const auto& own = usable[usable.size() - 1 - index];
-    if (wanted && !CpuSetsStillAvailable(own)) return;
-    std::vector<ULONG> current_thread;
-    if (wanted || (ReadThreadCpuSelection(GetCurrentThread(), current_thread) &&
-                   std::ranges::is_permutation(current_thread, owned_thread_selection))) {
-        if (!CallSetThreadSelectedCpuSets(GetCurrentThread(), wanted ? own.data() : nullptr,
-                                          wanted ? ULONG(own.size()) : 0)) return;
+    if (wanted) {
+        CallSetThreadSelectedCpuSets(GetCurrentThread(), own.data(), ULONG(own.size()));
+    } else {
+        CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
     }
-    owned_thread_selection = wanted ? own : std::vector<ULONG>{};
     using Fn = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
     static const auto set_default = KernelProc<Fn>("SetProcessDefaultCpuSets");
     if (slot == std::countr_zero(mask) && set_default) {
@@ -451,19 +356,22 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
         for (size_t i = 0; i + owners < usable.size(); ++i) {
             rest.insert(rest.end(), usable[i].begin(), usable[i].end());
         }
-        if (wanted && !CpuSetsStillAvailable(rest)) {
-            release_thread_if_owned();
-            return;
+        if (wanted) {
+            set_default(GetCurrentProcess(), rest.data(), ULONG(rest.size()));
+        } else {
+            set_default(GetCurrentProcess(), nullptr, 0);
         }
-        if (!set_default(GetCurrentProcess(), wanted ? rest.data() : nullptr,
-                         wanted ? ULONG(rest.size()) : 0)) {
-            if (wanted) CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
-            return;
+        // FIX-GT7-107: compile work's "every core" is the rest and the compile cores.
+        std::scoped_lock lk{g_wide_mutex};
+        g_wide_ids.clear();
+        if (wanted) {
+            g_wide_ids = rest;
+            if (CompileCoresOn()) {
+                g_wide_ids.insert(g_wide_ids.end(), classes.compile_ids.begin(),
+                                  classes.compile_ids.end());
+            }
         }
-        owned_process_default = wanted ? rest : std::vector<ULONG>{};
-        owner_policy_default = owned_process_default;
     }
-    applied = state;
 }
 
 bool HybridCpu() {
@@ -481,8 +389,6 @@ struct DriverCompileThreads {
         u32 outside = 0;       ///< samples outside the compiler
         bool confined = false; ///< the compiler's: on the compile cores
         int priority = THREAD_PRIORITY_NORMAL; ///< PERF-GT7-032: its own, when confined
-        int applied_priority = THREAD_PRIORITY_NORMAL;
-        bool priority_owned = false;
     };
     std::mutex mutex;
     std::unordered_map<DWORD, Thread> threads; ///< unnamed threads still looked at, and confined
@@ -492,6 +398,8 @@ struct DriverCompileThreads {
     // (FIX-GT7-008).
     int waits = 0;
     int catch_up = 0;
+    int backlog = 0; ///< FIX-GT7-106
+    bool in_play = false; ///< FIX-GT7-109
     int foreground = 0;
     bool applied_wide = false;
     bool applied_low = false;
@@ -511,19 +419,16 @@ DriverCompileThreads& DriverThreads() {
 void ApplyCompileCores(HANDLE thread, bool wide) {
     const auto& ids = GetCoreClasses().compile_ids;
     if (wide) {
-        CallSetThreadSelectedCpuSets(thread, nullptr, 0);
-    } else if (CpuSetsStillAvailable(ids)) {
+        SetWideCores(thread); // FIX-GT7-107
+    } else {
         CallSetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
     }
 }
 
-void ApplyCompilePriority(DriverCompileThreads::Thread& thread, bool low) {
-    const int next = low ? std::min(thread.priority, int(THREAD_PRIORITY_BELOW_NORMAL))
-                         : thread.priority;
-    if (SetThreadPriority(thread.handle, next)) {
-        thread.applied_priority = next;
-        thread.priority_owned = true;
-    }
+void ApplyCompilePriority(const DriverCompileThreads::Thread& thread, bool low) {
+    SetThreadPriority(thread.handle,
+                      low ? std::min(thread.priority, int(THREAD_PRIORITY_BELOW_NORMAL))
+                          : thread.priority);
 }
 
 // PERF-GT7-032: the confined threads follow the counts (under the mutex). A draw waiting for its
@@ -531,33 +436,35 @@ void ApplyCompilePriority(DriverCompileThreads::Thread& thread, bool low) {
 // for). A build a thread waits for on itself: the compile cores, below normal (it goes first). A
 // catch-up: every core, below normal (the time the game's and the renderer's threads leave).
 void ApplyCompileState(DriverCompileThreads& d) {
-    const bool wide = d.waits > 0 || (d.catch_up > 0 && d.foreground == 0);
-    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0 || CompileAlwaysLow());
+    // FIX-GT7-106: a backlog of draws on screen: every core (FIX-GT7-107), foreground or not,
+    // below normal priority: Monza's first race filled in at 7.7 pipelines a second, the same as at
+    // normal priority. RYGT_COMPILE_BACKLOG_LOW=0: the driver threads' own priority.
+    const bool wide = !d.in_play && // FIX-GT7-109
+                      (d.waits > 0 || d.backlog > 0 || (d.catch_up > 0 && d.foreground == 0));
+    static const bool backlog_low = [] {
+        const char* env = std::getenv("RYGT_COMPILE_BACKLOG_LOW");
+        return !(env && env[0] == '0');
+    }();
+    const bool low = d.waits == 0 && (d.backlog == 0 || backlog_low) &&
+                     (d.foreground > 0 || d.catch_up > 0 || d.backlog > 0 || CompileAlwaysLow());
     d.wide_now.store(wide, std::memory_order_relaxed);
     d.low_now.store(low, std::memory_order_relaxed);
-    if (!ProcessPolicyStillAllowed()) return;
     const bool cores = wide != d.applied_wide;
     const bool priority = low != d.applied_low;
-    const bool previous_wide = d.applied_wide;
     d.applied_wide = wide;
     d.applied_low = low;
     if (!cores && !priority) {
         return;
     }
-    for (auto& [tid, thread] : d.threads) {
+    for (const auto& [tid, thread] : d.threads) {
         if (!thread.confined) {
             continue;
         }
         if (cores) {
-            std::vector<ULONG> current;
-            const auto& expected = GetCoreClasses().compile_ids;
-            if (ReadThreadCpuSelection(thread.handle, current) &&
-                (previous_wide ? current.empty() : std::ranges::is_permutation(current, expected)))
-                ApplyCompileCores(thread.handle, wide);
+            ApplyCompileCores(thread.handle, wide);
         }
         if (priority) {
-            const int expected = thread.priority_owned ? thread.applied_priority : thread.priority;
-            if (GetThreadPriority(thread.handle) == expected) ApplyCompilePriority(thread, low);
+            ApplyCompilePriority(thread, low);
         }
     }
 }
@@ -610,21 +517,18 @@ bool ForEachProcessThread(unsigned long access,
         if (previous && !previous_kept) {
             CloseHandle(previous);
         }
-        if (status < 0 || !next)
-            return static_cast<ULONG>(status) == 0x8000001aUL; // STATUS_NO_MORE_ENTRIES
+        if (status < 0 || !next) {
+            break;
+        }
         previous = next;
-        try { previous_kept = fn(next, GetThreadId(next)); }
-        catch (...) { CloseHandle(next); throw; }
+        previous_kept = fn(next, GetThreadId(next));
     }
+    return true;
 }
 
 void ConfineDriverCompileThreads() {
     const auto& classes = GetCoreClasses();
-    if (!ProcessPolicyStillAllowed()) {
-        ReleaseDriverCompileThreads();
-        return;
-    }
-    if (classes.external_restrictions || classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
+    if (classes.hybrid || classes.compile_ids.empty() || !CompileCoresOn()) {
         return;
     }
     uintptr_t compiler_begin = 0, compiler_end = 0;
@@ -662,16 +566,13 @@ void ConfineDriverCompileThreads() {
     ++d.calls;
     const auto alive = [&](DWORD tid) { return std::ranges::binary_search(tids, tid); };
     std::erase_if(d.threads, [&](auto& item) {
-        DWORD exit_code = 0;
-        if (alive(item.first) && GetExitCodeThread(item.second.handle, &exit_code) &&
-            exit_code == STILL_ACTIVE) {
+        if (alive(item.first)) {
             return false;
         }
         CloseHandle(item.second.handle);
         return true;
     });
-    // A reused TID must not inherit an earlier thread's skipped status.
-    d.left.clear();
+    std::erase_if(d.left, [&](const auto& item) { return !alive(item.first); });
     u32 found = 0;
     for (const DWORD tid : tids) {
         if (d.left.contains(tid)) {
@@ -683,10 +584,7 @@ void ConfineDriverCompileThreads() {
             thread.handle = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_LIMITED_INFORMATION |
                                            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                        FALSE, tid);
-            // The TID may have been reused after enumeration; never inspect or
-            // suspend a thread belonging to another process.
-            if (!thread.handle || GetProcessIdOfThread(thread.handle) != GetCurrentProcessId() ||
-                HasThreadSelection(thread.handle) || !Unnamed(thread.handle)) {
+            if (!thread.handle || !Unnamed(thread.handle)) {
                 // Ours and the game's threads have names; so do most others.
                 if (thread.handle) {
                     CloseHandle(thread.handle);
@@ -722,7 +620,6 @@ void ConfineDriverCompileThreads() {
             }
         }
         if (ip >= compiler_begin && ip < compiler_end) {
-            if (!ProcessPolicyStillAllowed() || HasThreadSelection(thread.handle)) continue;
             thread.confined = true;
             // PERF-GT7-032: its own priority, given back after a catch-up.
             if (const int own = GetThreadPriority(thread.handle);
@@ -764,24 +661,6 @@ void ConfineDriverCompileThreads() {
     }
 }
 
-void ReleaseDriverCompileThreads() {
-    auto& d = DriverThreads();
-    std::scoped_lock lock{d.mutex};
-    for (auto& [id, thread] : d.threads) {
-        if (thread.confined) {
-            std::vector<ULONG> current;
-            if (ReadThreadCpuSelection(thread.handle, current) &&
-                std::ranges::is_permutation(current, GetCoreClasses().compile_ids))
-                CallSetThreadSelectedCpuSets(thread.handle, nullptr, 0);
-            if (thread.priority_owned && GetThreadPriority(thread.handle) == thread.applied_priority)
-                SetThreadPriority(thread.handle, thread.priority);
-        }
-        CloseHandle(thread.handle);
-    }
-    d.threads.clear();
-    d.left.clear();
-}
-
 void SetCompileCoresWide(bool wide) {
     auto& d = DriverThreads();
     // FIX-GT7-008: the count changes and the threads follow it under one lock. Applied from the
@@ -800,6 +679,20 @@ void SetCompileCatchUp(bool on) {
     auto& d = DriverThreads();
     std::scoped_lock lk{d.mutex};
     d.catch_up += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+void SetCompileBacklog(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.backlog += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+void SetCompileInPlay(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.in_play = on;
     ApplyCompileState(d);
 }
 
@@ -846,17 +739,14 @@ void BeginForegroundCompile() {
         const auto& classes = GetCoreClasses();
         self.moved = false;
         const auto get_sets = GetThreadSelectedCpuSetsProc();
-        if (get_sets && !classes.external_restrictions && ProcessPolicyStillAllowed() && !classes.hybrid && CompileCoresOn() &&
-            !classes.game_ids.empty() && CpuSetsStillAvailable(classes.game_ids)) {
+        if (get_sets && !classes.hybrid && CompileCoresOn() && !classes.game_ids.empty()) {
             ULONG count = 0;
             get_sets(current, nullptr, 0, &count);
             self.sets.resize(count);
             if (count == 0 || get_sets(current, self.sets.data(), count, &count)) {
                 self.sets.resize(count);
-                if (self.sets.empty() || (compile_selection_applied &&
-                    std::ranges::is_permutation(self.sets, compile_selection)))
-                    self.moved = CallSetThreadSelectedCpuSets(current, classes.game_ids.data(),
-                                                          ULONG(classes.game_ids.size())) != FALSE;
+                self.moved = CallSetThreadSelectedCpuSets(current, classes.game_ids.data(),
+                                                      ULONG(classes.game_ids.size())) != FALSE;
             }
         }
     }
@@ -877,14 +767,10 @@ void EndForegroundCompile() {
     if (--self.depth == 0) {
         const HANDLE current = GetCurrentThread();
         if (self.moved) {
-            std::vector<ULONG> current_sets;
-            if (ReadThreadCpuSelection(current, current_sets) &&
-                std::ranges::is_permutation(current_sets, GetCoreClasses().game_ids))
-                CallSetThreadSelectedCpuSets(current, self.sets.empty() ? nullptr : self.sets.data(),
-                                         ULONG(self.sets.size()));
+            CallSetThreadSelectedCpuSets(current, self.sets.empty() ? nullptr : self.sets.data(),
+                                     ULONG(self.sets.size()));
         }
-        if (self.priority != THREAD_PRIORITY_ERROR_RETURN &&
-            GetThreadPriority(current) == std::max(self.priority, int(THREAD_PRIORITY_ABOVE_NORMAL))) {
+        if (self.priority != THREAD_PRIORITY_ERROR_RETURN) {
             SetThreadPriority(current, self.priority);
         }
     }
@@ -967,7 +853,39 @@ void PreferPerformanceCores() {}
 
 void PreferEfficiencyCores() {}
 
+void PreferCompileCores() {}
+
 void AllowAllCores() {}
+void UpdateCoreOwner(u32, bool) {}
+
+bool HybridCpu() {
+    return false;
+}
+
+void ConfineDriverCompileThreads() {}
+bool ForEachProcessThread(unsigned long, const std::function<bool(void*, unsigned long)>&) {
+    return false; // PERF-GT7-054: Windows only
+}
+
+void SetCompileCoresWide(bool) {}
+
+bool CompileCoresWide() {
+    return false;
+}
+
+void SetCompileCatchUp(bool) {}
+
+void SetCompileBacklog(bool) {}
+
+void SetCompileInPlay(bool) {}
+
+bool CompileThreadsLow() {
+    return false;
+}
+
+void BeginForegroundCompile() {}
+
+void EndForegroundCompile() {}
 
 int CurrentCoreIsFast() {
     return -1;

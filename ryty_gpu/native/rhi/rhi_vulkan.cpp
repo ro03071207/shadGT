@@ -435,15 +435,17 @@ public:
         static_assert(sizeof(vk::CommandBuffer) == sizeof(u64));
         return ring ? reinterpret_cast<const u64*>(&cmd) : nullptr;
     }
-    Vulkan::CmdBuf C() const { return ring ? Vulkan::CmdBuf{ring, &cmd} : Vulkan::CmdBuf{cmd}; }
-    void BeginHere();
 
     /// Whether the GPU is done with the list (its retire fence reached the value).
     bool Retired() const;
 
-#ifndef NDEBUG
-    GpuListTiming* timing = nullptr;
-#endif
+    /// PERF-GT7-018: where commands go: the command buffer, or the ring for one replayed there.
+    Vulkan::CmdBuf C() const {
+        return ring ? Vulkan::CmdBuf{ring, &cmd} : Vulkan::CmdBuf{cmd};
+    }
+    /// Makes (deferred lists: or resets) and begins the command buffer.
+    void BeginHere();
+
     VulkanDevice& device;
     ThreadPool* pool;
     vk::CommandBuffer cmd;
@@ -1606,11 +1608,6 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
 }
 
 CommandList* VulkanDevice::AcquireDeferredCommandList(void* command_ring) {
-#ifndef NDEBUG
-    // The existing timing collector owns recorder-thread counters and raw command buffers.
-    // Retain that diagnostic path until it can be synchronized across ring replay.
-    if (gpu_timing_enabled) return nullptr;
-#endif
     // PERF-GT7-018: these lists' pool (under no thread's id) is used only by the thread that
     // replays the ring, which makes, resets, records and ends its command buffers; the caller
     // keeps the books (which lists are free) and resets their descriptor pools, which it uses.
@@ -1906,10 +1903,6 @@ void VulkanCommandList::End() {
     if (!pool) {
         return; // Externally ended
     }
-#ifndef NDEBUG
-    if (!ring)
-    device.EndGpuTiming(timing, cmd);
-#endif
     C().end();
 }
 
@@ -2183,9 +2176,6 @@ void VulkanCommandList::DrawIndexed(u32 indices, u32 instances, u32 first_index,
 }
 
 void VulkanCommandList::Dispatch(u32 x, u32 y, u32 z) {
-#ifndef NDEBUG
-    if (timing) { ++timing->dispatches; timing->dispatch_groups += u64{x} * y * z; }
-#endif
     C().dispatch(x, y, z);
 }
 

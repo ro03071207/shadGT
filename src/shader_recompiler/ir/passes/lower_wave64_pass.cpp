@@ -330,7 +330,10 @@ static bool ReadsActiveLanes(const IR::Inst& inst) {
 
 static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runtime,
                                    const Profile& profile) {
-    const bool enabled = Shader::LaneReadUnbranchEnabled();
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_LANE_READ_UNBRANCH");
+        return !(env && env[0] == '0');
+    }();
     const auto [size_x, size_y, size_z] = runtime.hw.cs.workgroup_size;
     if (!enabled || size_x * size_y * size_z != 64) {
         return;

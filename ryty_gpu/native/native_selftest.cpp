@@ -284,23 +284,7 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
     }
     Rhi::CommandList* list = device.AcquireCommandList();
     list->Begin();
-    std::unique_ptr<Rhi::Buffer> batch_echo;
-    DownloadBatch batch;
-    if (batch_download) {
-        batch_echo = device.CreateBuffer({.size = size + 512,
-            .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc |
-                     Rhi::BufferUsageTransferDst,
-            .memory = Rhi::MemoryKind::Readback});
-        if (!batch_echo || !registry.BeginDownloads(batch, 4 * Common::AlignUp(size, u64{256}), 256)) {
-            log += "download batch setup failed\n";
-            return false;
-        }
-        list->FillBuffer(tiled.get(), 0, size, 0x5a5a5a5a);
-        list->FillBuffer(batch_echo.get(), 0, size + 512, 0x3c3c3c3c);
-        list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
-        list->FillBuffer(batch_echo.get(), 256, size, 0x5a5a5a5a);
-    }
-    registry.RecordUploads(*list);
+    registry.RecordUploads(*list); // Initialize the target before replacing it with the pattern.
     list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list->CopyBufferToImage(pattern.get(), target->image.get(), MipCopies(target_info));
     list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
@@ -1574,21 +1558,24 @@ bool RunImageSelfTest(std::string& log) {
             ok = RunCase(*device, registry, *fence, tick, mode, log) && ok;
             ok = RunCase(*device, registry, *fence, tick, mode, log, 256, 192, true) && ok;
         }
-        ok = RunCase(*device, registry, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned,
-                     log, 256, 192, true) && ok;
-        const auto& reuse = registry.GetUploadStats();
-        // Exercise the actual large CPU staging + untiling/copy path with two
-        // distinct textures, repeated uploads and shared scratch barriers.
-        ok = RunCase(*device, registry, *fence, tick, AmdGpu::TileMode::Thin2DThin,
-                     log, 2048, 2048) && ok;
-        ok = RunCase(*device, registry, *fence, tick, AmdGpu::TileMode::Thin2DThin,
-                     log, 6144, 4608) && ok;
-        const bool scratch_ok = reuse.scratch_created.load() < reuse.scratch_reused.load() &&
-                                reuse.scratch_transient.load() == 0;
-        ok = scratch_ok && ok;
-        log += fmt::format("shared upload scratch: {} created, {} uses, {} transient; {}\n",
-            reuse.scratch_created.load(), reuse.scratch_reused.load(),
-            reuse.scratch_transient.load(), scratch_ok ? "passed" : "FAILED");
+        const auto remapped = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 32, 32, 1,
+                                       0x7000'8000'0000ULL);
+        auto* original = registry.Find(remapped, true, 2);
+        if (original) {
+            original->write_version.store(1);
+            registry.Invalidate(remapped.guest_address, 64, ImageRegistry::Stale::CpuWrite);
+            const bool cpu_write_preserves_target = registry.Find(remapped, true, 3) == original;
+            registry.Invalidate(remapped.guest_address, 64, ImageRegistry::Stale::Unmap);
+            auto* replacement = registry.Find(remapped, true, 4);
+            const bool unmap_replaces_target = original->reused.load() && replacement &&
+                replacement != original && !replacement->reused.load();
+            log += fmt::format("active target lifetime: CPU write preserves {}, unmap replaces {}\n",
+                               cpu_write_preserves_target, unmap_replaces_target);
+            ok = cpu_write_preserves_target && unmap_replaces_target && ok;
+        } else {
+            log += "active target lifetime: setup failed\n";
+            ok = false;
+        }
         const auto& stats = registry.GetStats();
         log += fmt::format("registry: {} lookups, {} textures, {} render targets, {} uploads\n",
                            stats.lookups.load(), stats.created_textures.load(),

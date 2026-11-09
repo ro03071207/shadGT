@@ -22,16 +22,19 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/elf_info.h"
+#include "common/singleton.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "video_core/renderer_vulkan/compile_pack.h"
+#include "video_core/renderer_vulkan/compile_pack_pipeline.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/shared_build_map.h"
 #include "video_core/renderer_vulkan/shader_object_cache.h"
-#include "video_core/renderer_vulkan/shader_object_policy.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
 #include "video_core/renderer_vulkan/idle_compile_queue.h"
@@ -210,8 +213,13 @@ private:
 // FIX-057: the driver compiles a tessellated pipeline with a lot of memory, and GT Sport's race
 // summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
-// Admit one heavy compile at a time: two simultaneous builds exhausted system
-// commit inside NVIDIA LLVM. -DisablePerf 79 disables this final driver-call gate.
+// At most two of them are created at the same time; -DisablePerf 79 lets them all run.
+// (PERF-GT7-029's three while compiles use every core gave way to PERF-172's limit.)
+// PERF-172: GT7's tessellated pipelines are compiled without optimization (FIX-057, PERF-081),
+// and two at a time held its cars back for most of a race start; up to RYGT_TESS_BUILDS
+// (default 4) run at once while the process commits under half the RAM and 4 GB stay free, two
+// otherwise. RYGT_TESS_BUILDS=2 is the old limit. (Six, with twelve builds at a time, cost fps
+// during a race start's backlog: the CPU is the limit.)
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -220,7 +228,12 @@ public:
             return;
         }
         const auto start = std::chrono::steady_clock::now();
-        Semaphore().acquire();
+        {
+            auto& gate = State();
+            std::unique_lock lk{gate.mutex};
+            gate.cv.wait(lk, [&] { return gate.running < Limit(); });
+            ++gate.running;
+        }
         held = true;
         const auto waited = std::chrono::steady_clock::now() - start;
         if (waited >= std::chrono::seconds{1}) {
@@ -235,13 +248,57 @@ public:
     }
     ~HeavyBuildGate() {
         if (held) {
-            Semaphore().release();
+            auto& gate = State();
+            {
+                std::scoped_lock lk{gate.mutex};
+                --gate.running;
+            }
+            gate.cv.notify_all();
         }
     }
 
 private:
-    static std::counting_semaphore<64>& Semaphore() {
-        return HeavyPipelineGate();
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        u32 running = 0;
+    };
+    static Gate& State() {
+        static Gate gate;
+        return gate;
+    }
+    static u32 Limit() {
+        static const u32 asked = [] {
+            if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
+                return std::clamp(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 16u);
+            }
+            return 4u;
+        }();
+        if (asked <= 2) {
+            return asked;
+        }
+#ifdef _WIN32
+        MEMORYSTATUSEX status{.dwLength = sizeof(MEMORYSTATUSEX)};
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (GlobalMemoryStatusEx(&status) &&
+            K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                    sizeof(counters))) {
+            const bool tight = counters.PrivateUsage > status.ullTotalPhys / 2 ||
+                               status.ullAvailPhys < (4ull << 30);
+            if (tight) {
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-172: memory is tight ({} MB committed, {} MB free); "
+                                "tessellated pipelines build two at a time",
+                                counters.PrivateUsage >> 20, status.ullAvailPhys >> 20);
+                }
+                return 2;
+            }
+        }
+#endif
+        return asked;
     }
     bool held = false;
 };
@@ -273,6 +330,17 @@ static bool LinkTimeOptimization() {
         return env && env[0] == '1';
     }();
     return lto;
+}
+// AMD-320: fast-linked pipelines without the optimizer cost AMD far more GPU time than NVIDIA.
+// On AMD tessellated pipelines keep the optimizer. AMD-322: no link-time data and no second,
+// optimized link on AMD: on an RX 7600 (GT Sport) they made each menu pipeline take 0.4-0.7 s and
+// filled pipeline memory. RYGT_AMD_PIPELINE_POLICY=0 keeps the shared policy.
+static bool AmdPipelinePolicy(u32 vendor_id) {
+    static const bool allowed = [] {
+        const char* env = std::getenv("RYGT_AMD_PIPELINE_POLICY");
+        return !(env && env[0] == '0');
+    }();
+    return allowed && vendor_id == 0x1002;
 }
 static std::atomic<u64> lto_links{};
 static std::atomic<u64> lto_us{};
@@ -306,8 +374,8 @@ private:
 // PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
 // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
 // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
-// both compiled shader libraries and only link. Pipelines own their shared libraries.
-class StageLibraryCache {
+// both compiled shader libraries and only link. Libraries live until exit.
+class StageLibraryCache : public SharedBuildMap<vk::Pipeline> {
 public:
     using Owner = std::shared_ptr<vk::UniquePipeline>;
     static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
@@ -315,31 +383,6 @@ public:
     std::shared_future<Owner> Pending(vk::Device device, u64 key) {
         return libraries.Pending({device, key});
     }
-    // Port of MR14 PERF-GT7-041, adapted to device-scoped owned libraries.
-    // The shared creation cache also removes failed pending entries before retry.
-    template<class Factory>
-    std::pair<Owner, bool> GetOrCreate(vk::Device device, u64 key, bool share, Factory&& factory) {
-        bool created = false;
-        const auto create = [&] {
-            created = true;
-            return std::make_shared<vk::UniquePipeline>(factory(), device);
-        };
-        if (!share) return {create(), false};
-        const bool joining = libraries.Pending({device, key}).valid();
-        auto result = libraries.GetOrCreate({device, key}, create);
-        if (joining && !created) shared_waits.fetch_add(1, std::memory_order_relaxed);
-        if (!created) {
-            const u64 avoided = duplicates_avoided.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (avoided <= 3 || avoided % 64 == 0)
-                LOG_INFO(Render_Vulkan, "PERF-GT7-041: avoided {} duplicate stage-library compilations", avoided);
-        }
-        return {result, !created};
-    }
-    std::atomic<u64> shared_waits{};
-
-private:
-    SharedCreationCache<std::pair<vk::Device, u64>, vk::UniquePipeline> libraries;
-    std::atomic<u64> duplicates_avoided{0};
 };
 
 class LibraryKey {
@@ -386,7 +429,7 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
-    SerializationSupport& sdata, bool preloading)
+    SerializationSupport& sdata)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
     if (infos[u32(Shader::SwStage::TessellationControl)]) {
         const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
@@ -399,14 +442,16 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::Device device = instance.GetDevice();
-    SetStageInfos(infos);
-    // PERF-038: `preloading` builds a stored pipeline in the background. Its shader infos carry no
-    // user data and there are no guest buffers to read: vertex inputs and the tessellation
-    // helpers come from the stored serialization data; the runtime infos are the ones stored
-    // with each stage's specialization, so the pipeline is the one a draw would build.
-    BuildDescSetLayout(preloading);
+    if (infos[u32(Shader::SwStage::TessellationControl)]) { // FIX-227
+        const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
+        lds_emulation = tcs.lds_emulation;
+        lds_vertex_bytes = ((tcs.ls_stride + 15) / 16) * 16;
+    }
+    std::ranges::copy(infos, stages.begin());
+    std::ranges::copy(infos, canonical_stages.begin());
+    BuildDescSetLayout();
     const auto debug_str = GetDebugString();
-    BuildWatch watch{debug_str, preloading ? "stored pipeline build" : "pipeline build"};
+    BuildWatch watch{debug_str, "pipeline build"};
     const bool tessellated = stages[u32(Shader::SwStage::TessellationControl)] != nullptr;
 
     const vk::PushConstantRange push_constants = {
@@ -423,7 +468,7 @@ GraphicsPipeline::GraphicsPipeline(
     // dynamic patch control points and domain origin.
     const bool so_tessellation = instance.IsShaderObjectTessellationEnabled();
     const bool so_candidate =
-        ShaderObjectPolicyAllows(instance.IsShaderObjectEnabled(), lds_emulation, 0, 0) &&
+        instance.IsShaderObjectEnabled() &&
         (so_tessellation || (!tessellated && key.prim_type != AmdGpu::PrimitiveType::RectList &&
                              key.prim_type != AmdGpu::PrimitiveType::QuadList)) &&
         !infos[u32(Shader::SwStage::Geometry)] &&
@@ -457,7 +502,7 @@ GraphicsPipeline::GraphicsPipeline(
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
 
     VertexInputs<AmdGpu::Buffer> guest_buffers;
-    if (!preloading && !instance.IsVertexInputDynamicState()) {
+    if (!instance.IsVertexInputDynamicState()) {
         const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
         GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
                         guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
@@ -832,34 +877,58 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
-    // SO-017: GT7 HUD and menu blending use conventional pipelines by default.
+    // SO-001: a plain pipeline is drawn with shader objects: no pipeline is compiled. Not with
+    // tessellation (also the rect/quad list emulation), a geometry shader, sample shading or
+    // AMD's mixed sample counts, which shader objects can't express.
+    // SO-016 (diagnosis): kinds of pipelines kept as pipelines, a bit mask from RYGT_SO_SKIP or
+    // so_skip.txt in the game folder: 1 blending, 2 alpha to coverage, 4 logic op, 8 dual-source
+    // factors, 16 no pixel shader, 32 a partial colour write mask.
+    // SO-017: blended pipelines stay pipelines by default (with shader objects GT7's HUD lost
+    // its rev counter ticks and mirror frame and the menu cursor vanished). "0" in so_skip.txt or
+    // RYGT_SO_SKIP=0 draws them with shader objects again.
     static const u32 so_skip = [] {
         const char* env = std::getenv("RYGT_SO_SKIP");
         u32 bits = env ? u32(std::strtoul(env, nullptr, 0)) : 1u;
         if (std::FILE* file = std::fopen("so_skip.txt", "r")) {
             char text[32]{};
-            if (std::fgets(text, sizeof(text), file)) bits = u32(std::strtoul(text, nullptr, 0));
+            if (std::fgets(text, sizeof(text), file)) {
+                bits = u32(std::strtoul(text, nullptr, 0));
+            }
             std::fclose(file);
+        }
+        if (bits) {
+            LOG_WARNING(Render_Vulkan, "SO-016: pipelines kept for kinds {:#x}", bits);
         }
         return bits;
     }();
-    u32 kinds = 0;
-    for (u32 i = 0; i < key.num_color_attachments; ++i) {
-        const auto& a = attachments[i];
-        if (a.blendEnable) kinds |= 1;
-        const auto src1 = [](vk::BlendFactor f) {
-            return f == vk::BlendFactor::eSrc1Color || f == vk::BlendFactor::eSrc1Alpha ||
-                   f == vk::BlendFactor::eOneMinusSrc1Color || f == vk::BlendFactor::eOneMinusSrc1Alpha;
-        };
-        if (src1(a.srcColorBlendFactor) || src1(a.dstColorBlendFactor) ||
-            src1(a.srcAlphaBlendFactor) || src1(a.dstAlphaBlendFactor)) kinds |= 8;
-        if (key.write_masks[i] != (vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                                   vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA)) kinds |= 32;
+    bool skip_kind = false;
+    if (so_skip) {
+        u32 kinds = 0;
+        for (u32 i = 0; i < key.num_color_attachments; ++i) {
+            const auto& a = attachments[i];
+            kinds |= a.blendEnable ? 1u : 0u;
+            const auto src1 = [](vk::BlendFactor f) {
+                return f == vk::BlendFactor::eSrc1Color || f == vk::BlendFactor::eSrc1Alpha ||
+                       f == vk::BlendFactor::eOneMinusSrc1Color ||
+                       f == vk::BlendFactor::eOneMinusSrc1Alpha;
+            };
+            if (src1(a.srcColorBlendFactor) || src1(a.dstColorBlendFactor) ||
+                src1(a.srcAlphaBlendFactor) || src1(a.dstAlphaBlendFactor)) {
+                kinds |= 8;
+            }
+            if (key.write_masks[i] != (vk::ColorComponentFlagBits::eR |
+                                       vk::ColorComponentFlagBits::eG |
+                                       vk::ColorComponentFlagBits::eB |
+                                       vk::ColorComponentFlagBits::eA)) {
+                kinds |= 32;
+            }
+        }
+        kinds |= sdata.multisampling.alphaToCoverageEnable ? 2u : 0u;
+        kinds |= color_blending.logicOpEnable ? 4u : 0u;
+        kinds |= infos[u32(Shader::SwStage::Fragment)] ? 0u : 16u;
+        skip_kind = (kinds & so_skip) != 0;
     }
-    if (sdata.multisampling.alphaToCoverageEnable) kinds |= 2;
-    if (color_blending.logicOpEnable) kinds |= 4;
-    if (!infos[u32(Shader::SwStage::Fragment)]) kinds |= 16;
-    if (ShaderObjectPolicyAllows(so_candidate, lds_emulation, kinds, so_skip) &&
+    if (so_candidate && !skip_kind &&
         (key.num_samples <= 1 || !sdata.multisampling.sampleShadingEnable)) {
         const auto& raster = raster_chain.get<vk::PipelineRasterizationStateCreateInfo>();
         so_state.topology = topology;
@@ -877,21 +946,36 @@ GraphicsPipeline::GraphicsPipeline(
         so_state.logic_op_enable = color_blending.logicOpEnable != VK_FALSE;
         so_state.logic_op = color_blending.logicOp;
         so_state.attachments = key.num_color_attachments;
-        so_state.patch_control_points = tessellated || is_rect_list || is_quad_list
-                                            ? tessellation_state.patchControlPoints : 0;
+        so_state.patch_control_points =
+            tessellated || is_rect_list || is_quad_list
+                ? tessellation_state.patchControlPoints
+                : 0;
         if (CreateShaderObjects(modules, sdata, attachments,
                                 infos[u32(Shader::SwStage::Fragment)] != nullptr,
-                                independent_sets)) return;
+                                independent_sets)) {
+            return;
+        }
     }
-
-#ifndef NDEBUG
+    // SO-004 (diagnosis): why a pipeline was not made of shader objects, while they are on.
     if (instance.IsShaderObjectEnabled()) {
+        const char* why = !so_candidate
+            ? (infos[u32(Shader::SwStage::Geometry)] ? "geometry shader"
+               : key.depth_samples > key.num_samples   ? "depth samples"
+               : (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.persp_sample_ena ||
+                  runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.addr_flags.linear_sample_ena)
+                   ? "sample shading"
+                   : "colour samples or tessellation off")
+            : key.num_samples > 1 && sdata.multisampling.sampleShadingEnable
+                ? "sample shading enabled"
+                                                      : "shader object creation (code or driver)";
         static std::atomic<u32> rejected{};
-        if (const u32 n = ++rejected; n <= 30 || n % 200 == 0)
-            LOG_WARNING(Render_Vulkan, "SO-004: {} used a graphics pipeline ({} rejections)", GetDebugString(), n);
+        if (const u32 n = ++rejected; n <= 30 || n % 200 == 0) {
+            LOG_WARNING(Render_Vulkan, "SO-004: {} built as a pipeline: {} ({} so far)",
+                        GetDebugString(), why, n);
+        }
     }
-#endif
     if (so_candidate && instance.IsGraphicsPipelineLibrarySupported()) {
+        // SO-001: no shader objects after all: the layout libraries need (independent sets).
         auto layout_ci = layout_info;
         layout_ci.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
         auto [result, independent] = instance.GetDevice().createPipelineLayoutUnique(layout_ci);
@@ -900,9 +984,13 @@ GraphicsPipeline::GraphicsPipeline(
         pipeline_layout = std::move(independent);
     }
 
-    // Protect both library and whole-pipeline tessellation builds from the optimizer.
-    const bool amd_policy = AmdPipelinePolicyEnabled(instance.GetVendorID()); // AMD-320
-    const bool plain_tessellated = tessellated && !amd_policy;
+    // FIX-057: the driver's optimizer is what ran out of memory on GT Sport's tessellated
+    // pipelines (also whole, two at a time); they are compiled without optimization.
+    // -DisablePerf 81 optimizes them.
+    static const bool plain_tessellated_feature = Common::PerfFeatureEnabled(81);
+    const bool amd_policy = AmdPipelinePolicy(instance.GetVendorID()); // AMD-320
+    const bool plain_tessellated = plain_tessellated_feature && !amd_policy;
+    const bool lto_relink = !amd_policy && LinkTimeOptimization(); // AMD-322
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .flags = tessellated && plain_tessellated ? vk::PipelineCreateFlagBits::eDisableOptimization
@@ -923,18 +1011,28 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto create_start = std::chrono::steady_clock::now();
-    // Stored ordinary pipelines use the same shared stage libraries and fast link as draws.
-    // Whole-pipeline prewarm recompiles both stages for every target/blend permutation and
-    // does not populate the stage-library cache used when new runtime permutations appear.
-    const auto compile_policy = amd_policy
-        ? SharedPipelinePolicy::SelectAmd(
-              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
-              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(false)))
-        : SharedPipelinePolicy::Select(
-              SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
-              tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
-              tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
-    if (compile_policy.libraries) {
+    // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
+    // summary their library compiles (with link-time optimization info kept) took the process
+    // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
+    // PERF-GT7-040 (on by default, RYGT_GPL=0 turns it and PERF-GT7-041 off): tessellated
+    // pipelines are built from libraries too (still without optimization), so GT7's cars share compiled fragment and pre-raster
+    // libraries across their many state combinations and only fast-link. FIX-057's memory blow-up
+    // came with link-time optimization info kept in the libraries, which SHD-001 no longer does.
+    static const bool gpl_tessellated = [] {
+        // Four cold race starts (Deep Forest x3, Monza): car pipelines 607 -> 309 ms each, the
+        // same pictures, no new errors.
+        const char* env = std::getenv("RYGT_GPL");
+        return !(env && env[0] == '0') && !LinkTimeOptimization();
+    }();
+    static const bool whole_tessellated = Common::PerfFeatureEnabled(80) && !gpl_tessellated;
+    // DIAG-058 (SHADGT_NO_LIBRARIES=1): every pipeline is compiled whole, never fast-linked from
+    // libraries (does the summary's driver figure render differently from fast-linked ones?).
+    static const bool no_libraries = [] {
+        const char* env = std::getenv("SHADGT_NO_LIBRARIES");
+        return env && env[0] == '1';
+    }();
+    if (!no_libraries && instance.IsGraphicsPipelineLibrarySupported() &&
+        !(tessellated && whole_tessellated)) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a
         // fraction of a full compile. A worker then links the same libraries with link-time
@@ -999,8 +1097,10 @@ GraphicsPipeline::GraphicsPipeline(
             auto& part_info = part_infos[i];
             part_info = pipeline_info;
             part_info.pNext = &library_infos[i];
-            part_info.flags = pipeline_info.flags | vk::PipelineCreateFlagBits::eLibraryKHR;
-            if (compile_policy.background_optimization) {
+            // FIX-057: tessellated libraries keep the whole pipeline's disabled optimization.
+            part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR |
+                              (pipeline_info.flags & vk::PipelineCreateFlagBits::eDisableOptimization);
+            if (lto_relink) { // SHD-001, AMD-320
                 part_info.flags |= vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
             }
             part_info.stageCount = 0;
@@ -1015,6 +1115,62 @@ GraphicsPipeline::GraphicsPipeline(
                 part_info.layout = *fragment_layout; // SHD-002
             }
         }
+        // PERF-GT7-108: a shader library the driver compiled, kept as a compile pack recipe.
+        const auto record_library = [&](size_t i) {
+            CompilePack::LayoutDesc layout{
+                .flags = static_cast<u32>(VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT),
+                .push_stages =
+                    static_cast<u32>(static_cast<VkShaderStageFlags>(push_constants.stageFlags)),
+                .push_size = push_constants.size,
+            };
+            const bool fragment = i == 2;
+            for (u32 set = 0; set < num_sets; ++set) { // as library_layout (SHD-002)
+                const bool fragment_set =
+                    set == Shader::Backend::StageSet(u32(Shader::SwStage::Fragment));
+                if (fragment_set != fragment || set_layout_hashes[set] == 0) {
+                    continue;
+                }
+                layout.sets.resize(set + 1);
+                CompilePack::SetLayout desc;
+                desc.flags = set == push_set
+                                 ? static_cast<u32>(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                 : 0u;
+                for (const auto& binding : pack_bindings[set]) {
+                    if (binding.pImmutableSamplers) {
+                        return;
+                    }
+                    desc.bindings.push_back(
+                        {binding.binding, static_cast<u32>(binding.descriptorType),
+                         binding.descriptorCount,
+                         static_cast<u32>(static_cast<VkShaderStageFlags>(binding.stageFlags))});
+                }
+                layout.sets[set] = std::move(desc);
+            }
+            std::vector<u8> raw;
+            if (!CompilePack::SerializeLibrary(
+                    part_infos[i], layout, [](vk::ShaderModule m) { return ModuleCode(m); }, raw,
+                    false)) {
+                static std::atomic<u32> refused{};
+                if (++refused <= 5) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} library of {} not kept (state not known)",
+                             fragment ? "fragment" : "pre-raster", debug_str);
+                }
+                return;
+            }
+            static const auto pack_dir = CompilePack::Dir(
+                Common::FS::GetUserPath(Common::FS::PathType::CacheDir),
+                Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(), instance.GetVendorID(),
+                instance.GetDeviceID());
+            const auto file =
+                pack_dir / fmt::format("lib-{:016x}.pack", XXH3_64bits(raw.data(), raw.size()));
+            std::error_code ec;
+            static std::atomic<u32> kept{};
+            if (!std::filesystem::exists(file, ec) && CompilePack::WriteLibraryFile(file, raw)) {
+                if (const u32 n = ++kept; n == 1 || n % 200 == 0) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} library recipes kept", n);
+                }
+            }
+        };
         const auto create_library = [&](size_t i) {
             // Only this subset contains the tessellation shaders. Interface/fragment
             // compilation does not need to monopolize the heavy admission token.
@@ -1022,29 +1178,18 @@ GraphicsPipeline::GraphicsPipeline(
             BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
                                              : i == 2 ? "fragment library"
                                                       : "interface library"};
-            auto [library_result, library] = PipelineBinaryStore::CreateGraphics(
-                instance, device, pipeline_cache, part_infos[i]); // BIN-001
-            // AMD-OOM-001: AMD's compiler ran out of system memory (ErrorOutOfHostMemory,
-            // "LLVM ERROR: out of memory") with several builds at once, and the assertion below
-            // ended GT Sport. Wait, then retry alone (the heavy-build slot), up to six times.
-            for (int attempt = 1;
-                 attempt <= 6 && (library_result == vk::Result::eErrorOutOfHostMemory ||
-                                  library_result == vk::Result::eErrorOutOfDeviceMemory);
-                 ++attempt) {
-                LOG_WARNING(Render_Vulkan,
-                            "AMD-OOM-001: {} library of {} out of memory ({}); retry {} alone",
-                            i == 1 ? "pre-raster" : i == 2 ? "fragment" : "interface", debug_str,
-                            vk::to_string(library_result), attempt);
-                std::this_thread::sleep_for(std::chrono::milliseconds{250 * attempt});
-                HeavyBuildGate alone{!(tessellated && i == 1)};
-                auto retried = PipelineBinaryStore::CreateGraphics(instance, device,
-                                                                   pipeline_cache, part_infos[i]);
-                library_result = retried.result;
-                library = retried.value;
-            }
+            auto [library_result, library] = CreateWithRetries("library of", debug_str, [&] {
+                return device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+            }); // FIX-GT7-101
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
+            // FIX-GT7-136: a library recipe holds its stages' SPIR-V, kept only with shader
+            // objects on (without them every recipe was refused as "state not known").
+            if ((i == 1 || i == 2) && CompilePack::RecordingOn() &&
+                instance.IsShaderObjectEnabled()) {
+                record_library(i);
+            }
             return library;
         };
 
@@ -1074,6 +1219,8 @@ GraphicsPipeline::GraphicsPipeline(
             pre_raster_key.Add(state);
         }
 
+        // AMD-320: libraries with and without link-time data are different libraries.
+        pre_raster_key.Add(lto_relink);
         LibraryKey fragment_key{2};
         fragment_key.Add(part_infos[2].flags);
         // SHD-002: the fragment stage's set only.
@@ -1085,6 +1232,11 @@ GraphicsPipeline::GraphicsPipeline(
         // shading. The old key could link a cached 1x FS library to 4x output.
         AddFragmentMultisampleKey(fragment_key, sdata.multisampling);
         fragment_key.Add(pipeline_rendering_ci.viewMask);
+        // FIX-GT7-030: tessellated pipelines' libraries are not optimized (FIX-057): the others must
+        // not draw with them.
+        fragment_key.Add(lto_relink);
+        fragment_key.Add(static_cast<bool>(pipeline_info.flags &
+                                           vk::PipelineCreateFlagBits::eDisableOptimization));
         for (const auto state : dynamic_states) {
             fragment_key.Add(state);
         }
@@ -1094,34 +1246,50 @@ GraphicsPipeline::GraphicsPipeline(
         const u64 fragment_hash = fragment_key.Hash();
         // -DisablePerf 18 compiles every library for every pipeline, one after another.
         const bool share_libraries = Common::PerfFeatureEnabled(18);
-        auto pre_raster_owner = share_libraries ? library_cache.Find(device, pre_raster_hash) : nullptr;
-        auto fragment_owner = share_libraries ? library_cache.Find(device, fragment_hash) : nullptr;
-        vk::Pipeline pre_raster_library = pre_raster_owner ? **pre_raster_owner : vk::Pipeline{};
-        vk::Pipeline fragment_library = fragment_owner ? **fragment_owner : vk::Pipeline{};
-        bool pre_raster_reused = bool(pre_raster_library);
-        bool fragment_reused = bool(fragment_library);
-        // Pipeline workers already provide parallelism across pipelines. A nested
-        // std::async per fragment bypasses that budget and starts default-priority
-        // compilers alongside the low-priority workers. Build both stages on this
-        // worker; Acquire still shares in-flight and completed libraries.
         std::array<vk::Pipeline, 4> library_handles{};
-        library_handles[0] = create_library(0);
-        library_handles[3] = create_library(3);
-        // Fill independent fragments on the existing worker pool before waiting for
-        // the single tessellation compiler. No nested threads, no extra heavy jobs.
-        if (!fragment_library) {
-            auto [owner, reused] = library_cache.GetOrCreate(device, fragment_hash, share_libraries,
-                [&] { return create_library(2); });
-            fragment_owner = std::move(owner);
-            fragment_reused = reused;
-            fragment_library = **fragment_owner;
-        }
-        if (!pre_raster_library) {
-            auto [owner, reused] = library_cache.GetOrCreate(device, pre_raster_hash, share_libraries,
-                [&] { return create_library(1); });
-            pre_raster_owner = std::move(owner);
-            pre_raster_reused = reused;
-            pre_raster_library = **pre_raster_owner;
+        vk::Pipeline pre_raster_library;
+        vk::Pipeline fragment_library;
+        bool pre_raster_reused = false;
+        bool fragment_reused = false;
+        if (gpl_tessellated && share_libraries) {
+            // PERF-GT7-041: shared libraries compiled once even when builds overlap.
+            const bool may_wait = !g_pipeline_build_urgent; // FIX-GT7-030
+            auto fragment_shared = std::async(std::launch::async, [&] {
+                return library_cache.GetOrCreate(fragment_hash, may_wait,
+                                                 [&] { return create_library(2); });
+            });
+            library_handles[0] = create_library(0);
+            std::tie(pre_raster_library, pre_raster_reused) = library_cache.GetOrCreate(
+                pre_raster_hash, may_wait, [&] { return create_library(1); });
+            library_handles[3] = create_library(3);
+            std::tie(fragment_library, fragment_reused) = fragment_shared.get();
+        } else {
+            if (share_libraries) {
+                pre_raster_library = library_cache.Find(pre_raster_hash);
+                fragment_library = library_cache.Find(fragment_hash);
+            }
+            pre_raster_reused = bool(pre_raster_library);
+            fragment_reused = bool(fragment_library);
+            // PERF-018: the two shader libraries are compiled at the same time, the fragment one
+            // on another thread.
+            std::future<vk::Pipeline> fragment_future;
+            if (!fragment_library && share_libraries) {
+                fragment_future = std::async(std::launch::async, create_library, size_t{2});
+            }
+            library_handles[0] = create_library(0);
+            if (!pre_raster_library) {
+                pre_raster_library = create_library(1);
+                library_cache.Insert(pre_raster_hash, pre_raster_library);
+            }
+            library_handles[3] = create_library(3);
+            if (fragment_future.valid()) {
+                fragment_library = fragment_future.get();
+            } else if (!fragment_library) {
+                fragment_library = create_library(2);
+            }
+            if (!fragment_reused) {
+                library_cache.Insert(fragment_hash, fragment_library);
+            }
         }
         library_link->shared_libraries = {pre_raster_owner, fragment_owner};
         library_handles[1] = pre_raster_library;
@@ -1139,27 +1307,26 @@ GraphicsPipeline::GraphicsPipeline(
             .flags = pipeline_info.flags,
             .layout = *pipeline_layout,
         };
-        auto [link_result, linked] = device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        auto [link_result, linked] = CreateWithRetries("link of", debug_str, [&] {
+            return device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        }); // FIX-GT7-101
         ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
                    vk::to_string(link_result));
         pipeline = std::move(linked);
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-        const double library_ms =
-            std::chrono::duration<double, std::milli>(libraries_done - create_start).count();
-        if (!preloading || library_ms >= 20.0) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-                "link {:.1f} ms",
-                debug_str,
-                library_ms,
-                pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                          libraries_done)
-                    .count());
-        }
+        LOG_WARNING(
+            Render_Vulkan,
+            "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+            "link {:.1f} ms; PERF-GT7-041 shared waits {}",
+            debug_str,
+            std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
+            pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      libraries_done)
+                .count(),
+            library_cache.shared_waits.load());
 
-        if (!compile_policy.background_optimization) {
+        if (!lto_relink) {
             return; // SHD-001: the fast-linked pipeline is the one drawn with
         }
         auto promise = std::make_shared<std::promise<void>>();
@@ -1223,19 +1390,16 @@ GraphicsPipeline::GraphicsPipeline(
 
     HeavyBuildGate whole_gate{tessellated};
     std::optional<BuildWatch> whole_watch;
-    if (!preloading) {
-        whole_watch.emplace(debug_str, "whole pipeline compile");
-    }
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    whole_watch.emplace(debug_str, "whole pipeline compile");
+    auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
+        return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    }); // FIX-GT7-101
     whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
-    if (!preloading) {
-        LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                              create_start)
-                        .count());
-    }
+    LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          create_start)
+                    .count());
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -1251,16 +1415,16 @@ bool GraphicsPipeline::CreateShaderObjects(
     const bool tessellation = so_state.patch_control_points != 0;
     const auto code_of = [&](Shader::SwStage stage, const std::vector<u32>& generated) {
         const auto module = modules[u32(stage)];
-        return module ? ModuleCode(instance.GetDevice(), module) : generated;
+        return module ? ModuleCode(module) : generated;
     };
     std::array<std::vector<u32>, 4> code;
-    code[0] = ModuleCode(instance.GetDevice(), modules[u32(Shader::SwStage::Vertex)]);
+    code[0] = ModuleCode(modules[u32(Shader::SwStage::Vertex)]);
     if (tessellation) {
         code[1] = code_of(Shader::SwStage::TessellationControl, sdata.tcs);
         code[2] = code_of(Shader::SwStage::TessellationEval, sdata.tes);
     }
     if (fragment) {
-        code[3] = ModuleCode(instance.GetDevice(), modules[u32(Shader::SwStage::Fragment)]);
+        code[3] = ModuleCode(modules[u32(Shader::SwStage::Fragment)]);
     } else if (!sdata.fragment.empty()) {
         code[3] = sdata.fragment; // clip distance emulation's discard shader
     }
@@ -1312,10 +1476,8 @@ bool GraphicsPipeline::CreateShaderObjects(
                                      set_layout_hashes.size() * sizeof(set_layout_hashes[0]),
                                      share_key);
     struct ShaderObjectBuildFailed {};
-    auto& shared_sets = instance.ShaderObjectBuilds();
-#ifndef NDEBUG
+    static SharedBuildMap<std::array<vk::ShaderEXT, 4>> shared_sets;
     static std::atomic<u64> shared_hits{};
-#endif
     bool reused = false;
     try {
         auto result = shared_sets.GetOrCreate(share_key, true, [&] {
@@ -1354,17 +1516,7 @@ bool GraphicsPipeline::CreateShaderObjects(
                 });
             }
             std::array<VkShaderEXT, 4> created{};
-            struct CreatedShadersGuard {
-                VkDevice device;
-                std::array<VkShaderEXT, 4>& shaders;
-                ~CreatedShadersGuard() {
-                    for (const auto shader : shaders)
-                        if (shader) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(device, shader, nullptr);
-                }
-            } created_guard{instance.GetDevice(), created};
-#ifndef NDEBUG
             const auto create_start = std::chrono::steady_clock::now();
-#endif
             // SO-009: the driver's compiled shader objects are kept on disk (shader_objects in the cache
             // folder, one file a set, keyed by the stage code, layouts, flags, GPU and driver version)
             // and made from those binaries on later starts: the driver compiles a set only once.
@@ -1373,13 +1525,9 @@ bool GraphicsPipeline::CreateShaderObjects(
                 const char* env = std::getenv("RYGT_SO_CACHE");
                 return !(env && env[0] == '0');
             }();
-            const auto& binary_properties = instance.ShaderObjectProperties();
-            const u64 binary_key = XXH3_64bits_withSeed(binary_properties.shaderBinaryUUID.data(),
-                binary_properties.shaderBinaryUUID.size(),
-                share_key ^ u64(binary_properties.shaderBinaryVersion));
             const auto cache_file =
                 Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects" /
-                fmt::format("{:016x}.bin", binary_key ^ (u64(instance.GetDriverVersion()) << 32) ^
+                fmt::format("{:016x}.bin", share_key ^ (u64(instance.GetDriverVersion()) << 32) ^
                                                instance.GetDeviceID());
             // SO-013: format 2 adds a checksum of each binary: a damaged file is never handed to the
             // driver (compiled again and rewritten instead).
@@ -1394,12 +1542,10 @@ bool GraphicsPipeline::CreateShaderObjects(
                 }
                 if (!binaries.empty()) {
                     auto binary_infos = create_infos;
-                    std::vector<std::vector<ShaderBinaryBlock>> aligned_binaries(binary_infos.size());
                     for (size_t i = 0; i < binary_infos.size(); ++i) {
-                        aligned_binaries[i] = AlignShaderBinary(binaries[i]);
                         binary_infos[i].codeType = vk::ShaderCodeTypeEXT::eBinary;
                         binary_infos[i].codeSize = binaries[i].size();
-                        binary_infos[i].pCode = aligned_binaries[i].data();
+                        binary_infos[i].pCode = binaries[i].data();
                     }
                     result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
                         instance.GetDevice(), static_cast<u32>(binary_infos.size()),
@@ -1428,16 +1574,16 @@ bool GraphicsPipeline::CreateShaderObjects(
 #ifdef _WIN32
                 const HANDLE thread = GetCurrentThread();
                 const int priority = GetThreadPriority(thread);
-                const int applied = std::min(priority, int(THREAD_PRIORITY_BELOW_NORMAL));
-                const bool owns_priority = lower && priority != THREAD_PRIORITY_ERROR_RETURN &&
-                                           SetThreadPriority(thread, applied);
+                if (lower) {
+                    SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+                }
 #endif
                 result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
                     instance.GetDevice(), static_cast<u32>(create_infos.size()),
                     reinterpret_cast<const VkShaderCreateInfoEXT*>(create_infos.data()), nullptr,
                     created.data());
 #ifdef _WIN32
-                if (owns_priority && GetThreadPriority(thread) == applied) {
+                if (lower) {
                     SetThreadPriority(thread, priority);
                 }
 #endif
@@ -1445,24 +1591,11 @@ bool GraphicsPipeline::CreateShaderObjects(
                     // Written beside and renamed, so a reader never sees half a file.
                     std::error_code ec;
                     std::filesystem::create_directories(cache_file.parent_path(), ec);
-                    static std::atomic<u64> temp_sequence{};
                     auto temporary = cache_file;
-#ifdef _WIN32
-                    const u64 process = GetCurrentProcessId();
-#else
-                    const u64 process = static_cast<u64>(getpid());
-#endif
-                    temporary += fmt::format(".{}.{}.tmp", process, temp_sequence.fetch_add(1));
+                    temporary += fmt::format(".{}", std::hash<std::thread::id>{}(
+                                                        std::this_thread::get_id()));
                     bool ok = false;
-                    struct TempCleanup {
-                        const std::filesystem::path& path;
-                        bool owned{};
-                        ~TempCleanup() { if (owned) { std::error_code ignored; std::filesystem::remove(path, ignored); } }
-                    } temp_cleanup{temporary};
-                    using FileOwner = std::unique_ptr<std::FILE, decltype(&std::fclose)>;
-                    FileOwner output{std::fopen(temporary.string().c_str(), "wbx"), &std::fclose};
-                    if (std::FILE* file = output.get()) {
-                        temp_cleanup.owned = true;
+                    if (std::FILE* file = std::fopen(temporary.string().c_str(), "wb")) {
                         const u32 count = static_cast<u32>(create_infos.size());
                         ok = std::fwrite(&CacheMagic, 4, 1, file) == 1 &&
                              std::fwrite(&count, 4, 1, file) == 1;
@@ -1481,20 +1614,16 @@ bool GraphicsPipeline::CreateShaderObjects(
                                  std::fwrite(&checksum, 8, 1, file) == 1 &&
                                  std::fwrite(data.data(), 1, size, file) == size;
                         }
-                        ok = std::fclose(output.release()) == 0 && ok;
+                        std::fclose(file);
                     }
                     if (ok) {
-#ifdef _WIN32
-                        if (!MoveFileExW(temporary.c_str(), cache_file.c_str(), MOVEFILE_WRITE_THROUGH))
-                            ec = std::error_code(GetLastError(), std::system_category());
-#else
-                        std::filesystem::create_hard_link(temporary, cache_file, ec);
-                        if (!ec) std::filesystem::remove(temporary, ec);
-#endif
+                        std::filesystem::rename(temporary, cache_file, ec);
+                    }
+                    if (!ok || ec) {
+                        std::filesystem::remove(temporary, ec);
                     }
                 }
             }
-#ifndef NDEBUG
             static std::atomic<u32> binary_hits{};
             static std::atomic<u32> compiled{};
             (from_binary ? binary_hits : compiled).fetch_add(1, std::memory_order_relaxed);
@@ -1519,31 +1648,81 @@ bool GraphicsPipeline::CreateShaderObjects(
                                 binary_hits.load(), compiled.load(), timed, total_ms / timed, max_ms);
                 }
             }
-#endif
+            // PERF-GT7-108: a set the driver compiled from SPIR-V, kept as a compile pack recipe.
+            if (result == VK_SUCCESS && !from_binary && use_cache && CompilePack::RecordingOn()) {
+                static const auto pack_dir = CompilePack::Dir(
+                    Common::FS::GetUserPath(Common::FS::PathType::CacheDir),
+                    Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(),
+                    instance.GetVendorID(), instance.GetDeviceID());
+                const auto pack_file = CompilePack::File(pack_dir, share_key);
+                std::error_code pack_ec;
+                if (!std::filesystem::exists(pack_file, pack_ec)) {
+                    CompilePack::Recipe recipe{
+                        .key = share_key,
+                        .flags = static_cast<u32>(static_cast<VkShaderCreateFlagsEXT>(flags)),
+                        .push_stages =
+                            static_cast<u32>(static_cast<VkShaderStageFlags>(push_constants.stageFlags)),
+                        .push_size = push_constants.size,
+                    };
+                    bool recordable = true;
+                    recipe.sets.resize(num_sets);
+                    for (u32 set = 0; set < num_sets; ++set) {
+                        recipe.sets[set].flags =
+                            set == push_set
+                                ? static_cast<u32>(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                : 0u;
+                        for (const auto& binding : pack_bindings[set]) {
+                            recordable = recordable && binding.pImmutableSamplers == nullptr;
+                            recipe.sets[set].bindings.push_back(
+                                {binding.binding, static_cast<u32>(binding.descriptorType),
+                                 binding.descriptorCount,
+                                 static_cast<u32>(static_cast<VkShaderStageFlags>(binding.stageFlags))});
+                        }
+                    }
+                    for (const auto& info : create_infos) {
+                        auto& stage = recipe.stages.emplace_back();
+                        stage.stage = static_cast<u32>(info.stage);
+                        stage.next = static_cast<u32>(static_cast<VkShaderStageFlags>(info.nextStage));
+                        const auto* words = static_cast<const u32*>(info.pCode);
+                        stage.code.assign(words, words + info.codeSize / sizeof(u32));
+                    }
+                    static std::atomic<u32> recorded{};
+                    if (recordable && CompilePack::Write(pack_file, recipe)) {
+                        const u32 n = ++recorded;
+                        if (n == 1 || n % 500 == 0) {
+                            LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} compile pack recipes kept ({})",
+                                     n, pack_dir.string());
+                        }
+                    }
+                }
+            }
             if (result != VK_SUCCESS) {
                 static std::atomic<u32> logged{};
                 if (++logged <= 8) {
                     LOG_WARNING(Render_Vulkan, "SO-001: shader objects failed ({}); a pipeline instead",
                                 vk::to_string(vk::Result(result)));
                 }
+                for (const VkShaderEXT shader : created) {
+                    if (shader) {
+                        VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(instance.GetDevice(), shader,
+                                                                         nullptr);
+                    }
+                }
                 throw ShaderObjectBuildFailed{};
             }
-            auto objects = std::make_shared<SharedShaderObjects>();
-            objects->device = instance.GetDevice();
+            std::array<vk::ShaderEXT, 4> objects{};
             for (u32 i = 0; i < 4; ++i) {
                 if (!code[i].empty()) {
-                    objects->objects[i] = vk::ShaderEXT{created[slot[i]]};
-                    created[slot[i]] = VK_NULL_HANDLE;
+                    objects[i] = vk::ShaderEXT{created[slot[i]]};
                 }
             }
             return objects;
         });
-        shader_objects = result.first->objects;
+        shader_objects = result.first;
         reused = result.second;
     } catch (const ShaderObjectBuildFailed&) {
         return false;
     }
-#ifndef NDEBUG
     if (reused) {
         const u64 hits = ++shared_hits;
         if (hits <= 3 || hits % 200 == 0) {
@@ -1551,7 +1730,6 @@ bool GraphicsPipeline::CreateShaderObjects(
                         GetDebugString(), hits);
         }
     }
-#endif
     for (u32 i = 0; i < so_state.attachments; ++i) {
         const auto& attachment = attachments[i];
         so_state.blend_enable[i] = attachment.blendEnable;
@@ -1567,7 +1745,6 @@ bool GraphicsPipeline::CreateShaderObjects(
     if (reused) {
         return true;
     }
-#ifndef NDEBUG
     static std::atomic<u32> made{};
     static std::atomic<u32> made_tessellated{};
     const u32 n = ++made;
@@ -1577,7 +1754,6 @@ bool GraphicsPipeline::CreateShaderObjects(
                     "SO-001: {} drawn with shader objects ({} so far, {} tessellated, SO-003)",
                     GetDebugString(), n, t);
     }
-#endif
     return true;
 }
 
@@ -1732,7 +1908,7 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
     const Shader::Info& vs_info) const;
 
-void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
+void GraphicsPipeline::BuildDescSetLayout() {
     // SHD-002: one set per stage, its bindings numbered from 0.
     std::array<boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32>,
                Shader::Backend::MaxDescriptorSets>
@@ -1759,9 +1935,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
-            if (!preloading) {
-                [[maybe_unused]] const auto sharp = buffer.GetSharp(*stage);
-            }
+            [[maybe_unused]] const auto sharp = buffer.GetSharp(*stage);
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -1819,6 +1993,11 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     const vk::Device device = instance.GetDevice();
     num_sets = 0;
     set_layout_hashes = {};
+    if (CompilePack::RecordingOn()) { // PERF-GT7-108
+        for (u32 set = 0; set < set_bindings.size(); ++set) {
+            pack_bindings[set].assign(set_bindings[set].begin(), set_bindings[set].end());
+        }
+    }
     for (u32 set = 0; set < set_bindings.size(); ++set) {
         auto& bindings = set_bindings[set];
         if (bindings.empty()) {

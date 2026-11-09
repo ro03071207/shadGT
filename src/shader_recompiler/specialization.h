@@ -216,7 +216,7 @@ struct StageSpecialization {
             // getting a new translation (one in 16 pixel shader translations was such a copy).
             true);
         ForEachSharp(binding, fmasks, info->fmasks,
-                     [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
+                     [this](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          if (!FMaskKeyEnabled()) {
                              spec.width = sharp.width;
                              spec.height = sharp.height;
@@ -285,7 +285,7 @@ struct StageSpecialization {
                 const auto sharp = desc.GetSharp(info);
                 if (!sharp) {
                     out.push_back(0);
-                } else if (Common::PerfFeatureEnabled(83) && sharp.GetSize() >= (u64{1} << 30)) {
+                } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
                     out.push_back(1);
                 } else {
                     out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
@@ -295,6 +295,7 @@ struct StageSpecialization {
         }
         out.push_back(0xb0f5);
         const bool usage_known = info.resource_usage_known;
+        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
         for (size_t i = 0; i < info.buffers.size(); ++i) {
             const auto& desc = info.buffers[i];
             const auto sharp = desc.GetSharp(info);
@@ -303,9 +304,9 @@ struct StageSpecialization {
                 continue;
             }
             u64 w = 1;
-            // Keep empty-address buffers distinct even where directional matching
-            // permits them to reuse an existing specialization.
-            if (!desc.IsSpecial() && sharp.base_address == 0) w |= 2;
+            if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
+                w |= 2;
+            }
             w |= u64(!usage_known || info.buffer_stride_used[i] ? sharp.GetStride() : 0) << 2;
             if (usage_known) {
                 w |= u64(sharp.add_tid_enable) << 16;
@@ -331,10 +332,8 @@ struct StageSpecialization {
             const auto sharp = desc.GetSharp(info);
             // Unbound images too: the constructor records what translation saw (SHD-003).
             u64 w = sharp ? 1 : 0;
-            const auto type = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
-                                  ? AmdGpu::ImageType::Invalid
-                                  : sharp.GetViewType(desc.is_array);
-            w |= u64(type) << 1;
+            const bool fmask = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt());
+            w |= u64(fmask ? AmdGpu::ImageType::Invalid : sharp.GetViewType(desc.is_array)) << 1;
             w |= u64(AmdGpu::IsInteger(sharp.GetNumberFmt())) << 8;
             w |= u64(desc.is_written) << 9;
             if (desc.is_written) {
@@ -353,17 +352,14 @@ struct StageSpecialization {
                 out.push_back(0);
                 continue;
             }
-            u64 width = sharp.width;
-            u64 height = sharp.height;
-            if (FMaskKeyEnabled()) {
-                width = 0;
-                height = 0;
-                if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
-                    width = desc.size_read ? sharp.width + 1 : 1;
-                    height = desc.size_read ? sharp.height + 1 : 1;
-                }
+            u64 w = 1;
+            if (!FMaskKeyEnabled()) {
+                w |= u64(sharp.width) << 8 | u64(sharp.height) << 32;
+            } else if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
+                w |= u64(desc.size_read ? sharp.width + 1 : 1) << 8 |
+                     u64(desc.size_read ? sharp.height + 1 : 1) << 32;
             }
-            out.push_back(1 | width << 8 | height << 32);
+            out.push_back(w);
         }
         out.push_back(0x5a3b);
         for (const auto& desc : info.samplers) {

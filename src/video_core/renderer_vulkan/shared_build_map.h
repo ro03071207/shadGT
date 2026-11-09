@@ -28,18 +28,6 @@ public:
         values.emplace(key, value);
     }
 
-    // The owner must first join all producers. Destruction then runs outside the map lock.
-    template <typename Destroy>
-    void Drain(Destroy&& destroy) {
-        std::unordered_map<std::uint64_t, Value> old;
-        {
-            std::scoped_lock lk{mutex};
-            if (!pending.empty()) std::terminate();
-            old.swap(values);
-        }
-        for (auto& [key, value] : old) destroy(value);
-    }
-
     /// PERF-GT7-041 (RYGT_GPL=1): the value of the key, built by the first caller only; a caller
     /// that needs one another build is working on waits for it instead of building it again (a
     /// race start queues many cars that share their pixel shaders). Second: it was reused.
@@ -84,17 +72,10 @@ public:
                 throw;
             }
         }();
-        try {
+        {
             std::scoped_lock lk{mutex};
             values.emplace(key, value);
             pending.erase(key);
-        } catch (...) {
-            {
-                std::scoped_lock lk{mutex};
-                pending.erase(key);
-            }
-            promise.set_exception(std::current_exception());
-            throw;
         }
         promise.set_value(value);
         return {value, false};

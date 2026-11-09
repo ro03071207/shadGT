@@ -519,8 +519,6 @@ public:
     virtual const DeviceCaps& Caps() const = 0;
 
     virtual std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) = 0;
-    // The caller must prove all CPU recording/replay and GPU uses completed,
-    // or that this allocation was never submitted. Frees memory before retry.
     virtual void DestroyCompletedBuffer(std::unique_ptr<Buffer> buffer) {}
     /// Wraps existing CPU memory (page aligned, `Caps().host_import_alignment`) as a buffer the
     /// GPU reads and writes in place; nullptr when unsupported.

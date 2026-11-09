@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fstream>
-#include <atomic>
-#include <chrono>
 #include <boost/container/small_vector.hpp>
 
 #include "common/perf_monitor.h"
@@ -18,6 +16,21 @@
 
 namespace Vulkan {
 
+namespace {
+/// The subgroup size compute pipelines are built with on this device, and whether it is asked
+/// for (FIX-GT7-026: the same rule for a pipeline and for a recipe built ahead).
+u32 RequiredSubgroup(const Instance& instance) {
+    return instance.IsSubgroupSize64Supported() ? 64u : 32u;
+}
+
+bool UseSubgroupControl(const Instance& instance) {
+    // FIX-188: Intel Arc (#65) runs compute in 32-wide subgroups when it can't do 64.
+    return instance.IsSubgroupSize64Supported() ||
+           (instance.IsIntel() && instance.IsSubgroupSizeControlSupported() &&
+            instance.SubgroupSize() == 32u);
+}
+} // namespace
+
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
@@ -30,15 +43,11 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     canonical_stages[int(Shader::SwStage::Compute)] = &info_;
     const auto debug_str = GetDebugString();
 
-    const u32 required_subgroup = instance.IsSubgroupSize64Supported() ? 64u : 32u;
+    const u32 required_subgroup = RequiredSubgroup(instance);
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = required_subgroup,
     };
-    // FIX-188: Intel Arc (#65) runs compute in 32-wide subgroups when it can't do 64.
-    const bool use_subgroup_control =
-        instance.IsSubgroupSize64Supported() ||
-        (instance.IsIntel() && instance.IsSubgroupSizeControlSupported() &&
-         instance.SubgroupSize() == 32u);
+    const bool use_subgroup_control = UseSubgroupControl(instance);
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .pNext = use_subgroup_control ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
@@ -122,8 +131,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+    auto [pipeline_result, pipe] = CreateWithRetries("compute pipeline", debug_str, [&] {
+        return instance.GetDevice().createComputePipelineUnique(pipeline_cache,
+                                                                compute_pipeline_ci);
+    }); // FIX-GT7-101
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -134,55 +145,13 @@ ComputePipeline::~ComputePipeline() = default;
 
 namespace {
 constexpr u32 RecipeMagic = 0x43574752; // "RGWC"
-constexpr u32 RecipeVersion = 2;
-u64 RecipeSignature(const Instance& instance, const Shader::Profile& p) {
-    u64 hash = 1469598103934665603ull;
-    const auto add = [&](u64 v) { for (u32 i=0;i<8;++i) { hash ^= (v >> (i*8)) & 255; hash *= 1099511628211ull; } };
-    const auto props = instance.GetPhysicalDevice().getProperties();
-    // Recipe translation ABI: bump when stored SPIR-V layout or policy changes.
-    constexpr u32 TranslationAbiVersion = 3; // FIX-317: six push-offset vectors.
-    add(TranslationAbiVersion);
-    add(Shader::LaneReadUnbranchEnabled());
-    add(props.vendorID);
-    for (const auto v : {u64(p.direct_buffers),u64(p.max_viewport_width),u64(p.max_viewport_height),
-        u64(p.max_shared_memory_size),u64(p.supported_spirv),u64(p.subgroup_size),u64(p.sparse_page_shift),
-        u64(p.support_int8),u64(p.support_int16),u64(p.support_int64),u64(p.support_float16),u64(p.support_float64),
-        u64(p.supports_denorm_behavior_independence),u64(p.supports_rounding_mode_independence),
-        u64(p.support_fp16_denorm_preserve),u64(p.support_fp16_denorm_flush),u64(p.support_fp16_round_to_zero),
-        u64(p.support_fp32_denorm_preserve),u64(p.discard_kills),u64(p.support_fp32_denorm_flush),
-        u64(p.support_fp32_round_to_zero),u64(p.support_fp64_denorm_preserve),u64(p.support_fp64_denorm_flush),
-        u64(p.support_fp64_round_to_zero),u64(p.support_fp16_signed_zero_inf_nan_preserve),
-        u64(p.support_fp32_signed_zero_inf_nan_preserve),u64(p.support_fp64_signed_zero_inf_nan_preserve),
-        u64(p.supports_image_load_store_lod),u64(p.supports_native_cube_calc),u64(p.native_cube_sampling),
-        u64(p.supports_trinary_minmax),u64(p.supports_buffer_fp32_atomic_min_max),u64(p.supports_image_fp32_atomic_min_max),
-        u64(p.supports_buffer_int64_atomics),u64(p.supports_shared_int64_atomics),u64(p.supports_workgroup_explicit_memory_layout),
-        u64(p.supports_amd_shader_explicit_vertex_parameter),u64(p.supports_fragment_shader_barycentric),
-        u64(p.supports_shader_subgroup_clock),u64(p.amd_vertex_order),u64(p.amd_nan_rules),
-        u64(p.supports_quad_derivatives),u64(p.vertex_order_check),u64(p.has_broken_spirv_clamp),
-        u64(p.lower_left_origin_mode),u64(p.needs_manual_interpolation),u64(p.needs_lds_barriers),
-        u64(p.intel_arc_workarounds),u64(p.needs_buffer_offsets),u64(p.needs_unorm_fixup),
-        u64(p.needs_clip_distance_emulation),u64(p.supports_shader_stencil_export)}) add(v);
-    const std::array<const char*, 4> policies{std::getenv("SHADGT_DISABLE_PERF"),
-        std::getenv("RYGT_FMASK_KEY"), std::getenv("RYGT_UNNORMALIZED_MIP"),
-        std::getenv("RYGT_FLOAT_ATOMIC_EXACT")};
-    for (const char* str : policies) {
-        if (str) for (; *str; ++str) add(static_cast<unsigned char>(*str));
-        add(0xff);
-    }
-    return hash;
-}
+constexpr u32 RecipeVersion = 1;
 } // namespace
-
-u64 ComputePipeline::RecipePolicy(const Instance& instance, const Shader::Profile& profile) {
-    return RecipeSignature(instance, profile);
-}
 
 bool ComputePipeline::SaveRecipe(const std::filesystem::path& file,
                                  std::span<const u32> spirv) const {
-    const u64 signature = RecipeSignature(instance, profile);
     std::vector<u32> words{RecipeMagic,
                            RecipeVersion,
-                           u32(signature), u32(signature >> 32),
                            u32(recipe_push),
                            u32(recipe_subgroup_control),
                            recipe_subgroup,
@@ -194,50 +163,84 @@ bool ComputePipeline::SaveRecipe(const std::filesystem::path& file,
     }
     words.push_back(u32(spirv.size()));
     words.insert(words.end(), spirv.begin(), spirv.end());
-    return WriteComputeWarmRecipeExclusive(file, words);
+    // Beside the file and renamed, so a cut write never leaves half a recipe.
+    auto temp = file;
+    temp += ".tmp";
+    {
+        std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(words.data()),
+                  std::streamsize(words.size() * sizeof(u32)));
+        if (!out) {
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, file, ec);
+    return !ec;
 }
 
-bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Profile& profile, vk::PipelineCache cache,
-                                     const std::filesystem::path& file, std::stop_token stop) {
+bool ComputePipeline::WarmFromRecipe(const Instance& instance, vk::PipelineCache cache,
+                                     const std::filesystem::path& file) {
     std::ifstream in{file, std::ios::binary};
     std::vector<u32> words;
     {
         std::error_code ec;
         const auto size = std::filesystem::file_size(file, ec);
-        if (ec || size < 9 * sizeof(u32) || size % sizeof(u32) != 0 || size > (16u << 20)) {
+        if (ec || size < 7 * sizeof(u32) || size % sizeof(u32) != 0 || size > (16u << 20)) {
             return false;
         }
-        // Skip stale policies before allocating/reading an entire old recipe.
-        std::array<u32, 4> header{};
-        in.read(reinterpret_cast<char*>(header.data()), sizeof(header));
-        if (!in || header[0] != RecipeMagic || header[1] != RecipeVersion ||
-            (u64(header[3]) << 32 | header[2]) != RecipeSignature(instance, profile)) return false;
-        in.seekg(0);
         words.resize(size / sizeof(u32));
         in.read(reinterpret_cast<char*>(words.data()), std::streamsize(size));
         if (!in) {
             return false;
         }
     }
-    if (!ValidateComputeWarmRecipe(words, RecipeSignature(instance, profile),
-        instance.MaxPushDescriptors(), profile.supported_spirv,
-        instance.IsIntel() && instance.IsSubgroupSizeControlSupported() && instance.SubgroupSize() == 32,
-        instance.IsSubgroupSize64Supported())) return false;
-    const bool push = words[4] != 0;
-    const bool subgroup_control = words[5] != 0;
-    const u32 subgroup = words[6];
-    const u32 count = words[7];
-    size_t at = 8;
+    if (words[0] != RecipeMagic || words[1] != RecipeVersion) {
+        return false;
+    }
+    const bool push = words[2] != 0;
+    const bool subgroup_control = words[3] != 0;
+    const u32 subgroup = words[4];
+    const u32 count = words[5];
+    size_t at = 6;
+    if (count > 256 || words.size() < at + size_t(count) * 3 + 1) {
+        return false;
+    }
+    // FIX-GT7-026: a recipe goes to the driver only as this device would build its pipeline
+    // (WarmComputeDir also keeps each GPU's and driver's apart): the same subgroup size request,
+    // the bindings the constructor makes (consecutive, of its four types), and push descriptors
+    // only within this device's limit. Another one is skipped, never left to the driver to
+    // refuse (asking for 64-wide subgroups where 32 is the most is invalid use).
+    if (subgroup_control != UseSubgroupControl(instance) ||
+        (subgroup_control && subgroup != RequiredSubgroup(instance))) {
+        return false;
+    }
     std::vector<vk::DescriptorSetLayoutBinding> bindings;
+    u32 next_binding = 0;
     for (u32 i = 0; i < count; ++i, at += 3) {
+        const auto type = vk::DescriptorType(words[at + 1]);
+        const u32 descriptors = words[at + 2];
+        if (words[at] != next_binding || descriptors == 0 || descriptors > 4096 ||
+            (type != vk::DescriptorType::eStorageBuffer &&
+             type != vk::DescriptorType::eStorageImage &&
+             type != vk::DescriptorType::eSampledImage && type != vk::DescriptorType::eSampler)) {
+            return false;
+        }
+        next_binding += descriptors;
         bindings.push_back({
             .binding = words[at],
-            .descriptorType = vk::DescriptorType(words[at + 1]),
-            .descriptorCount = words[at + 2],
+            .descriptorType = type,
+            .descriptorCount = descriptors,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
     }
+    if (push != (next_binding < instance.MaxPushDescriptors())) {
+        return false;
+    }
     const u32 spirv_words = words[at++];
+    if (spirv_words == 0 || words.size() - at != spirv_words) {
+        return false;
+    }
     const auto device = instance.GetDevice();
     auto [module_result, module] = device.createShaderModuleUnique({
         .codeSize = spirv_words * sizeof(u32),
@@ -284,13 +287,6 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
             },
         .layout = *layout,
     };
-    const bool gate = Common::PerfFeatureEnabled(79);
-    if (gate) {
-        while (!HeavyPipelineGate().try_acquire_for(std::chrono::milliseconds{50}))
-            if (stop.stop_requested()) return false;
-    }
-    SCOPE_EXIT { if (gate) HeavyPipelineGate().release(); };
-    if (stop.stop_requested()) return false;
     auto [pipeline_result, pipeline] = device.createComputePipelineUnique(cache, pipeline_ci);
     return pipeline_result == vk::Result::eSuccess;
 }

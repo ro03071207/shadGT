@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_dlssg.h"
 #include "ryty_gpu/rygt_dlss_api.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -33,6 +34,8 @@ struct Plugin {
     bool tried{};
     bool ready{}; // Init succeeded
 };
+// Upscaling through Streamline's sl.dlss.dll (ryty_dlssg.cpp) instead of the plugin.
+bool g_streamline{};
 Plugin g_plugin;
 
 std::string LastError() {
@@ -69,6 +72,10 @@ bool Load() {
     if (!EmulatorSettings.IsDlssEnabled()) {
         return false;
     }
+    if (RytyDlssG::UpscaleRequested()) {
+        // NVIDIA's own sl.dlss.dll is in the dlss folder: upscale through Streamline.
+        return false;
+    }
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring dir{exe};
@@ -77,8 +84,9 @@ bool Load() {
     HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!module) {
         LOG_WARNING(Render_Vulkan,
-                    "ryGT DLSS: dlss_enabled is on but dlss\\ryGT_dlss.dll could not be loaded "
-                    "(error {}); using FSR",
+                    "ryGT DLSS: dlss_enabled is on but neither dlss\\sl.dlss.dll (the "
+                    "launcher's Download NVIDIA DLSS button) nor dlss\\ryGT_dlss.dll could be "
+                    "loaded (error {}); using FSR",
                     GetLastError());
         return false;
     }
@@ -162,7 +170,11 @@ void AddDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical_devi
 }
 
 bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
-    if (g_plugin.ready) {
+    if (g_plugin.ready || g_streamline) {
+        return true;
+    }
+    if (RytyDlssG::InitUpscale()) {
+        g_streamline = true;
         return true;
     }
     if (!g_plugin.module) {
@@ -190,109 +202,27 @@ void Shutdown() {
     }
 }
 
-bool TemporalEnabled() {
-    return TemporalRequested() && g_plugin.ready && g_plugin.temporal_version &&
-           g_plugin.temporal_version() == RYGT_DLSS_TEMPORAL_API_VERSION &&
-           g_plugin.optimal_settings && g_plugin.evaluate_temporal;
-}
-
-bool GetOptimalSettings(u32 width, u32 height, RygtDlssQuality quality,
-                        RygtDlssOptimalSettings& settings) {
-    settings = {.struct_size = sizeof(settings)};
-    return TemporalEnabled() &&
-           g_plugin.optimal_settings(width, height, quality, &settings) == 0;
-}
-
-bool EvaluateTemporal(vk::CommandBuffer cmdbuf, const RygtDlssFrame& frame) {
-    if (!TemporalEnabled()) {
-        return false;
-    }
-    if (g_plugin.evaluate_temporal(cmdbuf, &frame) != 0) {
-        LOG_ERROR(Render_Vulkan, "ryGT temporal DLSS: {}", LastError());
-        return false;
-    }
-    return true;
-}
-
-bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size) {
-    return g_plugin.ready && g_plugin.supports(input_size.width, input_size.height,
-                                               output_size.width, output_size.height);
-}
-
-bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
-               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
-               vk::ImageView output, vk::Extent2D output_size) {
-    if (!CanScale(input_size, output_size)) {
-        return false;
-    }
-    const vk::MemoryBarrier2 input_barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-    };
-    const vk::ImageMemoryBarrier2 output_barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eGeneral,
-        .image = output_image,
-        .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1,
-                          .layerCount = 1},
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &input_barrier,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &output_barrier,
-    });
-    const RygtDlssImage in{
-        .image = static_cast<VkImage>(input_image),
-        .view = static_cast<VkImageView>(input),
-        .format = static_cast<VkFormat>(input_format),
-        .width = input_size.width,
-        .height = input_size.height,
-    };
-    const RygtDlssImage out{
-        .image = static_cast<VkImage>(output_image),
-        .view = static_cast<VkImageView>(output),
-        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-        .width = output_size.width,
-        .height = output_size.height,
-    };
-    if (g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) != 0) {
-        LOG_ERROR(Render_Vulkan, "ryGT DLSS (UI-HIRES): {}", LastError());
-        return false;
-    }
-    static vk::Extent2D logged_in{}, logged_out{};
-    if (input_size != logged_in || output_size != logged_out) {
-        logged_in = input_size;
-        logged_out = output_size;
-        LOG_INFO(Render_Vulkan, "ryGT DLSS: UI-HIRES scene {}x{} to {}x{}", input_size.width,
-                 input_size.height, output_size.width, output_size.height);
-    }
-    return true;
-}
-
-void Pass::Create(vk::Device device_, VmaAllocator allocator, u32 num_images) {
+void Pass::Create(vk::Device device_, VmaAllocator allocator_, u32 num_images) {
     device = device_;
+    allocator = allocator_;
     available_imgs.resize(num_images);
     for (u32 i = 0; i < num_images; ++i) {
         available_imgs[i].id = static_cast<u8>(i);
-        available_imgs[i].output_image = VideoCore::UniqueImage(device, allocator);
+        available_imgs[i].output_image = VideoCore::UniqueImage(device, allocator_);
     }
 }
 
 vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                            vk::Format input_format, vk::Extent2D input_size,
                            vk::Extent2D output_size) {
-    if (!g_plugin.ready || failed || TemporalRequested()) {
+    if ((!g_plugin.ready && !g_streamline) || failed) {
         return input;
     }
-    if (!g_plugin.supports(input_size.width, input_size.height, output_size.width,
-                           output_size.height)) {
+    const bool supported =
+        g_streamline ? RytyDlssG::UpscaleSupports(input_size, output_size)
+                     : g_plugin.supports(input_size.width, input_size.height, output_size.width,
+                                         output_size.height) != 0;
+    if (!supported) {
         return input;
     }
     if (output_size != cur_size) {
@@ -351,10 +281,16 @@ vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::
         .width = output_size.width,
         .height = output_size.height,
     };
-    const bool ok = g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) == 0;
+    const bool ok =
+        g_streamline
+            ? RytyDlssG::Upscale(device, allocator, cmdbuf, input_image, input, input_format,
+                                 input_size, img.output_image, img.output_image_view.get(),
+                                 vk::Format::eR16G16B16A16Sfloat, output_size)
+            : g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) == 0;
     if (!ok) {
         // The output was not written; stop trying and let FSR (or plain scaling) take over.
-        LOG_ERROR(Render_Vulkan, "ryGT DLSS: {}; falling back to FSR", LastError());
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS: {}; falling back to FSR",
+                  g_streamline ? std::string{"Streamline's DLSS failed"} : LastError());
         failed = true;
     }
 

@@ -12,26 +12,13 @@ namespace Vulkan {
 
 namespace {
 std::mutex code_mutex;
-std::unordered_map<VkDevice, std::unordered_map<VkShaderModule, std::vector<u32>>> module_code;
+std::unordered_map<VkShaderModule, std::vector<u32>> module_code;
 } // namespace
 
-std::vector<u32> ModuleCode(vk::Device device, vk::ShaderModule module) {
+std::vector<u32> ModuleCode(vk::ShaderModule module) {
     std::scoped_lock lock{code_mutex};
-    const auto by_device = module_code.find(static_cast<VkDevice>(device));
-    if (by_device == module_code.end()) return {};
-    const auto it = by_device->second.find(static_cast<VkShaderModule>(module));
-    return it != by_device->second.end() ? it->second : std::vector<u32>{};
-}
-
-void ForgetModuleCode(vk::Device device, vk::ShaderModule module) {
-    std::scoped_lock lock{code_mutex};
-    if (const auto it = module_code.find(static_cast<VkDevice>(device)); it != module_code.end())
-        it->second.erase(static_cast<VkShaderModule>(module));
-}
-
-void ClearModuleCode(vk::Device device) {
-    std::scoped_lock lock{code_mutex};
-    module_code.erase(static_cast<VkDevice>(device));
+    const auto it = module_code.find(static_cast<VkShaderModule>(module));
+    return it != module_code.end() ? it->second : std::vector<u32>{};
 }
 
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, bool keep_code) {
@@ -44,13 +31,8 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, bool k
     ASSERT_MSG(module_result == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}",
                vk::to_string(module_result));
     if (keep_code) {
-        try {
-            std::scoped_lock lock{code_mutex};
-            module_code[static_cast<VkDevice>(device)][static_cast<VkShaderModule>(module)].assign(code.begin(), code.end());
-        } catch (...) {
-            device.destroyShaderModule(module);
-            throw;
-        }
+        std::scoped_lock lock{code_mutex};
+        module_code[static_cast<VkShaderModule>(module)].assign(code.begin(), code.end());
     }
     return module;
 }

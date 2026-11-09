@@ -73,6 +73,32 @@ UnmapAliasFn UnmapAlias() {
 #endif
 }
 
+struct PendingRelease {
+    u64 tick;
+    void* alias;
+    VkDeviceMemory memory;
+    std::shared_ptr<Buffer> wrapper; // owns the VkBuffer (D6)
+};
+std::mutex g_pending_mutex;
+std::vector<PendingRelease> g_pending;
+std::atomic<bool> g_has_pending{false}; // checked on every bind without the lock
+// FIX-205: in native mode views dropped at an unmap wait for the native renderer's next list.
+std::atomic<bool> g_hold_for_splice{false};
+constexpr u64 HeldForSplice = ~u64{0};
+// D7: views a thread found lately, valid while no view was unmapped since (lock-free check).
+std::atomic<u64> g_unmap_generation{1};
+struct RecentView {
+    u64 generation;
+    VAddr begin;
+    VAddr end;
+};
+thread_local std::array<RecentView, 8> t_recent_views{};
+thread_local u32 t_recent_next = 0;
+// PERF-GT7-002: ranges a thread found imported whole (over one view or several), by their start:
+// GT7's busy scenes bind thousands of ranges a frame over more views than the eight above hold,
+// and each miss walked the view map page by page under the lock.
+thread_local std::array<RecentView, 256> t_recent_ranges{};
+
 } // namespace
 
 bool ParallelDirectViewsCoherent(const DirectMemory* owner, std::span<const std::pair<std::uint64_t,std::uint64_t>> ranges) noexcept {
@@ -236,21 +262,14 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
 }
 
 namespace {
-// PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
-// than pinning a whole multi-GiB allocation in one driver call. Zero restores
-// the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
+// PERF-GT7-022: a view was a whole allocation (up to 4 GiB): importing GT7's 2 GiB one pinned its
+// pages for ~440 ms, and the driver held every other call meanwhile, the present's submit too
+// (a frozen loading screen). Views are now pieces of at most this size, imported when something
+// in them is used. RYGT_D1_VIEW_MB=0: whole allocations as before.
 u64 ViewPiece() {
     static const u64 piece = [] {
         const char* env = std::getenv("RYGT_D1_VIEW_MB");
-        u64 mb = 256;
-        if (env && *env) {
-            char* end = nullptr;
-            errno = 0;
-            const u64 parsed = std::strtoull(env, &end, 10);
-            if (*env != '-' && end != env && *end == '\0' && errno != ERANGE && parsed <= 4096) {
-                mb = parsed;
-            }
-        }
+        const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 256;
         return mb == 0 ? u64{1} << 32 : mb << 20;
     }();
     return piece;
@@ -258,27 +277,27 @@ u64 ViewPiece() {
 } // namespace
 
 bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
-    Native::SlowCallTrace<8> trace{Native::trace_guest_hash_calls, "import-guest-view",
-        {"guest-view", "map-alias", "host-properties", "allocate-memory", "create-bind-buffer",
-         "device-address", "map-pages", "store-view"}};
-    trace.Next(0, address, 0);
 #ifdef _WIN32
     const VAddr allocation = GuestViewBase(address);
     if (allocation == 0) {
         return false;
     }
+    // PERF-GT7-022: the piece holding the address (pieces start at the allocation's base).
     const u64 piece = ViewPiece();
     VAddr base = allocation + (address - allocation) / piece * piece;
+    // After a view ending inside this piece (one cut short by the next view or the committed range).
     if (auto next = views.upper_bound(address); next != views.begin()) {
         base = std::max(base, std::prev(next)->second.end);
     }
-    if (failed.contains(base)) {
+    if (std::ranges::binary_search(failed, base)) {
         return false;
     }
-    const VAddr pieces_end = want_end > base + piece
-        ? std::min(base + 2 * piece,
-                   allocation + (want_end - 1 - allocation) / piece * piece + piece)
-        : base + piece;
+    // Up to the pieces `want_end` reaches (two at most), not into a view imported after them.
+    const VAddr pieces_end =
+        want_end > base + piece
+            ? std::min(base + 2 * piece, allocation + (want_end - 1 - allocation) / piece * piece +
+                                             piece)
+            : base + piece;
     VAddr end = std::min(GuestViewEnd(base, pieces_end - base), pieces_end);
     if (const auto next = views.upper_bound(base); next != views.end()) {
         end = std::min(end, next->second.begin);
@@ -301,7 +320,7 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         return fail("not whole pages");
     }
     if (end <= address) {
-        return fail("the address is past the piece");
+        return fail("the address is past the piece"); // PERF-GT7-022: not expected
     }
     const auto map_alias = MapAlias();
     if (!map_alias) {
@@ -511,123 +530,15 @@ bool DirectMemory::TryForEachPart(
         }
         cursor = std::min(end, view.end);
     }
-    if (outcome) *outcome = PartOutcome::Covered;
-    if (!ready()) return false;
-    for (VAddr cursor = address; cursor < end;) {
-        const View& view = std::prev(views.upper_bound(cursor))->second;
-        const u64 bytes = std::min(end, view.end) - cursor;
-        fn(*view.wrapper, cursor - view.begin, cursor - address, bytes);
-        cursor += bytes;
-    }
-    return true;
-}
-
-void DirectMemory::WarmImported(VAddr address, u64 size) {
-    // Speculative preparation must not wait behind another worker or the recorder.
-    // Bound both driver calls and time spent holding the shared view mutex. Large
-    // Windows allocations stay on the normal path: warming a tiny texture must
-    // not eagerly pin hundreds of MiB of unrelated backing.
-    constexpr u64 MaxWarmViewBytes = 4ull << 20;
-    constexpr u32 MaxWarmImports = 8;
-    if (size == 0 || size > (64ull << 20) || address > ImportedPageCoverage<>::Limit ||
-        size > ImportedPageCoverage<>::Limit - address) {
-        return;
-    }
-    std::unique_lock lock{mutex, std::try_to_lock};
-    if (!lock.owns_lock()) {
-        return;
-    }
-#ifdef RYTY_GPU
-    const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
-    if (failed_generation != mapping_generation) {
-        failed.clear();
-        failed_generation = mapping_generation;
-    }
-#endif
-    const VAddr end = address + size;
-    const auto started = std::chrono::steady_clock::now();
-    u32 imported = 0;
-    for (VAddr page = address & ~(PageSize - 1); page < end;) {
-        const auto failure = failed.upper_bound(page);
-        if (failure != failed.begin() && page < std::prev(failure)->second) {
-            return;
-        }
-        auto it = views.upper_bound(page);
-        if (it != views.begin()) {
-            const auto& view = std::prev(it)->second;
-            if (page >= view.begin && page < view.end) {
-                page = view.end;
-                continue;
-            }
-        }
-        if (imported >= MaxWarmImports ||
-            std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1)) {
-            return;
-        }
-        const VAddr base = GuestViewBase(page);
-        const VAddr view_end = base ? GuestViewEnd(base, MaxWarmViewBytes) : 0;
-        if (!base || view_end <= page || view_end - base > MaxWarmViewBytes) {
-            return;
-        }
-        if (!ImportView(page, end)) {
-            return;
-        }
-        ++imported;
-    }
-}
-
-bool DirectMemory::EnsureImported(VAddr address, u64 size) {
-    Native::SlowCallTrace<9> trace{Native::trace_guest_hash_calls, "ensure-imported",
-        {"pending-lock", "completion-query", "destroy-wrapper", "free-memory", "unmap-alias",
-         "recent-cache", "view-mutex", "mapping-generation", "lookup-import"}};
-    trace.Next(0, address, size);
-    // Imported-view destruction is queued at OnUnmap to the scheduler's
-    // GPU-gated background runner. Never drain old imports on a draw's bind path.
-    if (address > ImportedPageCoverage<>::Limit ||
-        size > ImportedPageCoverage<>::Limit - address) return false;
-    const VAddr end = address + size;
-    trace.Next(5);
-#ifndef NDEBUG
-    static thread_local u64 coverage_hits{}, coverage_misses{};
-#endif
-    if (imported_coverage.Covers(address, size)) {
-#ifndef NDEBUG
-        if ((++coverage_hits & 65535) == 0) {
-            LOG_INFO(Render_Vulkan,
-                     "IMPORT-COVERAGE: {} completed-range hits without view lock, {} misses",
-                     coverage_hits, coverage_misses);
-        }
-#endif
+    RecentView& range = t_recent_ranges[(address >> 12) % t_recent_ranges.size()];
+    if (range.generation == generation && address >= range.begin && end <= range.end) {
         return true;
     }
-#ifndef NDEBUG
-    ++coverage_misses;
-#endif
-    trace.Next(6);
     std::scoped_lock lk{mutex};
-#ifdef RYTY_GPU
-    // OnUnmap is reported before the host remap. A lookup during that window can
-    // fail, so discard negative results after the completed mapping is reported too.
-    trace.Next(7);
-    const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
-    if (failed_generation != mapping_generation) {
-        failed.clear();
-        failed_generation = mapping_generation;
-    }
-#endif
-    trace.Next(8);
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
-        // The bitmap skips already imported prefixes even when a later view in
-        // the request is missing. Retry each missing view through the old path.
-        if (const auto missing = imported_coverage.FirstMissing(page, end - page)) {
-            page = *missing;
-            if (page >= end) break;
-        }
-        // A failed view is retried by many draws (and again by the gather fallback).
-        // Its bounds are already known: avoid querying Windows for its base each time.
         const auto failure = failed.upper_bound(page);
         if (failure != failed.begin() && page < std::prev(failure)->second) {
-            return false;
+            return;
         }
         auto it = views.upper_bound(page);
         if (it != views.begin()) {
@@ -641,6 +552,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return false;
         }
     }
+    range = {generation, address, end};
     return true;
 }
 
@@ -666,17 +578,51 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
                         view.begin, view.end - view.begin, address, size, tick,
                         scheduler.CurrentTick(), n);
         }
-        }, [&](auto& held) { RetireLeasesAfterSplice(held, scheduler.CurrentTick()); });
-    // Even a partial unmap can replace part of a failed view with importable memory.
-    std::erase_if(failed, [&](const auto& view) {
-        return view.first < end && (view.second > address || view.first >= address);
-    });
+        {
+            std::scoped_lock pending_lk{g_pending_mutex};
+            // FIX-205: the native renderer records into lists of its own and puts each into the
+            // scheduler's work when it splices it, which can be a submission later than the one
+            // current now: a view freed after this tick could still be used by work the list
+            // holds. In native mode it is freed after the work of the native list spliced next.
+            const u64 release_tick =
+                g_hold_for_splice.load(std::memory_order_relaxed) ? HeldForSplice : tick;
+            g_pending.push_back({release_tick, view.alias, view.memory, std::move(view.wrapper)});
+            g_has_pending.store(true, std::memory_order_relaxed);
+        }
+        it = views.erase(it);
     }
     // Invalidate the GPU page table and coverage before publishing releases.
     // The runner waits for its captured CurrentTick before invoking callbacks;
     // a later tick is conservative if the recorder advanced during this unmap.
     // On queue failure the owners remain in held_native_releases until a later
     // successful retirement or GPU-idle teardown.
+}
+
+bool DirectMemory::ViewsOver(VAddr address, u64 size) {
+    std::scoped_lock lk{mutex};
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
+    auto it = views.upper_bound(address);
+    if (it != views.begin() && std::prev(it)->second.end > address) {
+        return true;
+    }
+    return it != views.end() && it->first < end;
+}
+
+void DirectMemory::HoldReleasesForSplice() {
+    g_hold_for_splice.store(true, std::memory_order_relaxed);
+}
+
+void DirectMemory::ReleaseHeldAfter(u64 tick) {
+    if (!g_has_pending.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::scoped_lock lk{g_pending_mutex};
+    for (PendingRelease& p : g_pending) {
+        if (p.tick == HeldForSplice) {
+            p.tick = tick; // FIX-205: after the spliced list's submission
+        }
+    }
 }
 
 DirectMemory::Stats DirectMemory::GetStats() const {

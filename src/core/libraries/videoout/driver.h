@@ -101,6 +101,12 @@ public:
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
                     u64 anti_lag_frame = 0);
 
+    /// PERF-111: with SHADGT_FPS_LOCK a game's submit-and-flip returns once the frames it
+    /// submitted before are on screen, so it runs one frame ahead of the screen instead of as
+    /// many as it has display buffers for (GT7 queued three: ~100 ms more input lag).
+    void NoteEopFlipRequested();
+    void PaceFlipSubmit();
+
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -112,7 +118,7 @@ private:
         Common::FrameQueueTrace::Ticket trace{};
 #ifndef NDEBUG
         std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
-#endif
+        u64 anti_lag_frame{};                              // PERF-210
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -122,8 +128,8 @@ private:
     void Flip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     bool DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                            Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
+                            u64 anti_lag_frame = 0);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;
@@ -131,6 +137,14 @@ private:
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    // PERF-111: EOP flips requested and not shown yet.
+    std::atomic<s32> eop_flips_in_flight{0};
+    std::mutex pace_mutex;
+    std::condition_variable pace_cv;
+    // GT-FF: fast flips: a flip request wakes the present thread, which
+    // shows the frame at once instead of at the next vblank (still at the flip rate at most).
+    std::condition_variable requests_cv;
+    std::chrono::steady_clock::time_point last_flip_time{};
 };
 
 } // namespace Libraries::VideoOut

@@ -88,9 +88,10 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
 #ifdef RYTY_GPU
     // FIX-102: frame generation starts once the splash screen is gone. With it on during the
-    // splash precompile, its presenter thread and the window thread deadlocked inside the NVIDIA
-    // driver (the presenter held the driver lock while DWM waited on a window message, the window
-    // thread waited for the lock), and every pipeline build then waited for that lock too.
+    // splash screen's pipeline builds, its presenter thread and the window thread deadlocked
+    // inside the NVIDIA driver (the presenter held the driver lock while DWM waited on a window
+    // message, the window thread waited for the lock), and every pipeline build then waited for
+    // that lock too.
     framegen_deferred =
         RytyFrameGen::Requested() && Libraries::SystemService::IsSplashVisible();
     // ryGT: FSR 3.1 frame generation makes the swapchain when it is on.
@@ -156,11 +157,7 @@ void Swapchain::RecreateSurface() {
     FindPresentMode();
     // FindPresentFormat() rechecked HDR10 support; the new surface may not advertise it, so the
     // swapchain must not keep requesting it.
-#ifdef RYTY_GPU
-    needs_hdr = supports_hdr;
-#else
     needs_hdr = needs_hdr && supports_hdr;
-#endif
     const vk::Format new_format = needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format;
     LOG_WARNING(Render_Vulkan, "FIX-218: surface lost; created a new surface (HDR={})", needs_hdr);
     if (new_format != previous_format) {

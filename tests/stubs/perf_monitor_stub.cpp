@@ -1,14 +1,16 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include <cstdlib>
-#include <string>
+
 #include "common/types.h"
 
 namespace Common {
-// Preserve the inspection tools' performance-switch behavior in standalone tests.
-bool PerfFeatureEnabled(u32 id) {
-    const char* env = std::getenv("SHADGT_DISABLE_PERF");
-    if (!env) return true;
-    const std::string list = std::string(",") + env + ",";
-    return list.find("," + std::to_string(id) + ",") == std::string::npos;
+
+// Every PERF switch at its default, as a run without SHADGT_DISABLE_PERF (common/perf_monitor.cpp).
+// Without diagnostics perf_monitor.h has its own (PERF-GT7-062).
+#ifdef SHADGT_DIAGNOSTICS
+bool PerfFeatureEnabled(u32) {
+    return true;
 }
-}
+#endif
+
+} // namespace Common

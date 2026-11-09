@@ -8,16 +8,20 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "common/diagnostics.h"
 #include "common/guest_clock.h"
-#include "common/mapping_writeback_gate.h"
+#include "common/io_file.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
@@ -41,6 +45,7 @@
 #include "ryty_gpu/ryty_upscaler_status.h"
 #include "ryty_gpu/native/gts_hooks.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/native/job_walker.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
@@ -51,6 +56,7 @@
 #endif
 #ifdef ENABLE_DISCORD_RPC
 #include "common/discord_rpc_handler.h"
+#include "core/file_format/psf.h"
 #endif
 #include <chrono>
 #include <cmath>
@@ -75,10 +81,22 @@ void RunWindowThread() {
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
-                                      Vulkan::NativeModeRequested()
-                                          ? "GTSport"
-                                          : "GTSport");
-    window.SetIcon({}); // shadGT's Gran Turismo Sport icon
+                                      "ryGT7 - Gran Turismo 7");
+    // Use the installed game's icon rather than embedding game artwork in the renderer.
+    const auto icon_path = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                           "app0" / "sce_sys" / "icon0.png";
+    Common::FS::IOFile icon_file{icon_path, Common::FS::FileAccessMode::Read};
+    std::vector<u8> icon;
+    if (icon_file.IsOpen()) {
+        const auto size = icon_file.GetSize();
+        if (size > 0 && size <= 16 * 1024 * 1024) {
+            icon.resize(size);
+            if (icon_file.ReadSpan<u8>(icon) != size) {
+                icon.clear();
+            }
+        }
+    }
+    window.SetIcon(icon);
     {
         std::scoped_lock lock{g_window_mutex};
         g_window = &window;
@@ -111,13 +129,16 @@ void RunWindowThread() {
         (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
-    try {
-        if (Vulkan::SaveDriverCacheAtExit())
-            LOG_INFO(Render_Vulkan, "CACHE-EXIT: driver pipeline save attempted before process termination");
-    } catch (const std::exception& error) {
-        LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
+    // FIX-GT7-023: the driver pipeline cache first (the destructor's save never runs).
+    const auto save_start = std::chrono::steady_clock::now();
+    if (const int saved_mb = Vulkan::SaveDriverCacheAtExit(); saved_mb >= 0) {
+        std::fprintf(stderr, "[window] driver pipeline cache saved: %d MB in %lld ms\n", saved_mb,
+                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::steady_clock::now() - save_start)
+                                                .count()));
     }
-    Common::Log::Flush();
+    std::fprintf(stderr, "[window] closed: the game ends\n");
+    std::fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
@@ -151,71 +172,8 @@ void StartFirstDrawWatcher() {
     }).detach();
 }
 
-// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
-// type in the window's top left corner, over the game and the splash screen.
-// PERF-098: the precompile of stored shaders and pipelines, as a translucent blue bar with
-// shadowed white text near the bottom of the splash screen (and of the game, if it is still
-// going when the game starts drawing).
-void DrawPrecompileProgress() {
-    using Clock = std::chrono::steady_clock;
-    const auto progress = Vulkan::GetPrecompileProgress();
-    static Clock::time_point finished{};
-    static bool shown = false;
-    if (progress.total == 0) {
-        return;
-    }
-    float alpha = 1.0f;
-    if (progress.active) {
-        shown = true;
-        finished = {};
-    } else {
-        if (!shown) {
-            return; // nothing was left to build: no bar at all
-        }
-        if (finished == Clock::time_point{}) {
-            finished = Clock::now();
-        }
-        // "Done" stays a moment, then fades out.
-        const float since = std::chrono::duration<float>(Clock::now() - finished).count();
-        alpha = std::clamp(1.0f - (since - 1.5f) / 0.5f, 0.0f, 1.0f);
-        if (alpha <= 0.0f) {
-            return;
-        }
-    }
-    const auto a = [alpha](float value) { return static_cast<int>(value * alpha); };
-    const float fraction =
-        progress.total ? float(progress.done) / float(progress.total) : 0.0f;
-    char text[96];
-    if (progress.active) {
-        std::snprintf(text, sizeof(text), "Precompiling shaders   %llu / %llu   %.0f%%",
-                      static_cast<unsigned long long>(progress.done),
-                      static_cast<unsigned long long>(progress.total), fraction * 100.0f);
-    } else {
-        std::snprintf(text, sizeof(text), "Shaders ready");
-    }
-    auto* draw = ImGui::GetForegroundDrawList();
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float width = std::clamp(viewport->Size.x * 0.36f, 240.0f, 720.0f);
-    const float bar_height = 6.0f;
-    const ImVec2 bar_min{viewport->Pos.x + (viewport->Size.x - width) * 0.5f,
-                         viewport->Pos.y + viewport->Size.y * 0.90f};
-    const ImVec2 bar_max{bar_min.x + width, bar_min.y + bar_height};
-    draw->AddRectFilled(bar_min, bar_max, IM_COL32(25, 80, 190, a(70)), bar_height * 0.5f);
-    if (fraction > 0.0f) {
-        draw->AddRectFilled(bar_min, {bar_min.x + width * fraction, bar_max.y},
-                            IM_COL32(70, 150, 255, a(175)), bar_height * 0.5f);
-    }
-    const ImVec2 size = ImGui::CalcTextSize(text);
-    const ImVec2 at{bar_min.x + (width - size.x) * 0.5f, bar_min.y - size.y - 6.0f};
-    for (const ImVec2 offset : {ImVec2{-1, 0}, ImVec2{1, 0}, ImVec2{0, -1}, ImVec2{0, 1},
-                                ImVec2{1, 1}, ImVec2{2, 2}}) {
-        draw->AddText({at.x + offset.x, at.y + offset.y}, IM_COL32(0, 0, 0, a(150)), text);
-    }
-    draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
-}
-
-// PERF-100: while a new shader compiles and the game is held, the same translucent style: a
-// notice with a moving bar over the last frame. Not for compiles shorter than 0.15 s.
+// PERF-100: while a new shader compiles and the game is held, a translucent notice with a
+// moving bar over the last frame. Not for compiles shorter than 0.15 s.
 void DrawCompileNotice() {
     using Clock = std::chrono::steady_clock;
     static Clock::time_point paused_since{};
@@ -259,14 +217,26 @@ void DrawCompileNotice() {
     draw->AddText(at, IM_COL32(255, 255, 255, 235), text);
 }
 
-// What the watermark says: the game and this renderer's revision. Empty in a tagged release, or
-// with RYGT_WATERMARK=0.
+// What the watermark says: this renderer's revision, after the prerelease's name when this is
+// that prerelease's renderer (manifest.json beside the exe has its commit; a test renderer copied
+// into a release leaves the release's manifest there). Empty in a tagged release, or with
+// RYGT_WATERMARK=0.
 std::string BuildWatermark() {
     const char* env = std::getenv("RYGT_WATERMARK");
     if (Common::g_is_release || (env && env[0] == '0')) {
         return {};
     }
-    return fmt::format("GT Sport | {}", Common::g_scm_desc);
+    const std::string revision = Common::g_scm_desc;
+    std::ifstream file{Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                       "manifest.json"};
+    const auto manifest = nlohmann::json::parse(file, nullptr, false);
+    const nlohmann::json::json_pointer commit{"/sources/shadGT7/commit"};
+    if (manifest.contains("name") && manifest["name"].is_string() && manifest.contains(commit) &&
+        manifest.at(commit).is_string() &&
+        revision.contains(manifest.at(commit).get<std::string>().substr(0, 7))) {
+        return fmt::format("{} | {}", manifest["name"].get<std::string>(), revision);
+    }
+    return revision;
 }
 
 std::string g_watermark;
@@ -289,14 +259,13 @@ void DrawWatermark() {
     draw->AddText(font, font_size, at, IM_COL32(235, 235, 235, 80), g_watermark.c_str());
 }
 
+// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
+// type in the window's top left corner, over the game and the splash screen.
 void DrawFpsCounter() {
     DrawWatermark();
     Ryty::DrawControllerOverlay();
-    Ryty::Camera::DrawOverlay();
-    DrawPrecompileProgress();
-    if (!Vulkan::GetPrecompileProgress().active) {
-        DrawCompileNotice();
-    }
+    DrawCompileNotice();
+    DrawWatermark();
     if (!EmulatorSettings.IsShowFpsCounter()) {
         return;
     }
@@ -579,17 +548,35 @@ void Ryty::RytyLibraryInitialize() {
             }
         }).detach();
     }
-#endif
     g_watermark = BuildWatermark();
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
+        // The game's title and id from app0\sce_sys\param.sfo next to the exe (GT7's runtime
+        // has one; GT Sport's when there is none), so GT7 shows as GT7.
+        std::string title = "Gran Turismo Sport";
+        std::string serial = "CUSA03220";
+        const auto sfo = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                         "app0" / "sce_sys" / "param.sfo";
+        std::error_code error;
+        if (PSF psf; std::filesystem::exists(sfo, error) && psf.Open(sfo)) {
+            if (const auto name = psf.GetString("TITLE")) {
+                title.assign(name->begin(), name->end());
+                // "Gran Turismo® 7": without the mark.
+                for (const std::string_view mark : {"\xC2\xAE", "\xE2\x84\xA2"}) {
+                    for (size_t at; (at = title.find(mark)) != std::string::npos;) {
+                        title.erase(at, mark.size());
+                    }
+                }
+            }
+            if (const auto id = psf.GetString("TITLE_ID")) {
+                serial.assign(id->begin(), id->end());
+            }
+        }
+        LOG_INFO(Render_Vulkan, "Discord presence: {} ({})", title, serial);
         auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
-        rpc->init();
-        rpc->setStatusPlaying("Gran Turismo Sport", "CUSA03220");
-        LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; Gran Turismo Sport presence initialized");
-    } else {
-        LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; disabled by saved game setting");
+        rpc->init(title, serial);
+        rpc->setStatusPlaying(title, serial);
     }
 #endif
     {
@@ -623,11 +610,21 @@ extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) 
     }
 }
 
+// FIX-GT7-085: the recorder's cache of readable 64 KB granules (NAT-147) forgets the range at each
+// report that follows a change. Ryty reports an unmap before it unmaps, and the recorder could
+// read the old pages in between and note their granules readable again; memory mapped there next
+// without CPU access (or protected by the game) then passed Native::Readable, and quad index
+// expansion read it.
+static void ForgetReadableAfterChange(u64 address, u64 size) {
+    Native::ForgetReadable(address, size);
+}
+
 // Ryty calls this after any change to guest mappings or protections (after an unmap completes,
 // for example), so lookups cached in between are not kept.
 extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 size) {
     Native::ForgetReadable(address, size);
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
 }
 
 // Ryty calls this after the game changed the protection of guest memory (sceKernelMprotect),
@@ -641,6 +638,7 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
     }
 #endif
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->GetPageManager().ReapplyProtection(address, size);
     }
@@ -655,7 +653,9 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
     }
 #endif
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+        rasterizer->OnNewMapping(address, size); // FIX-GT7-077
         rasterizer->MapMemory(address, size);
         rasterizer->RegisterMemory(address, size);
         // FIX-153: new memory comes writable. Pages the renderer still tracks there (tracked

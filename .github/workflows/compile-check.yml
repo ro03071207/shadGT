@@ -2,7 +2,7 @@ name: Renderer PR compile check
 
 on:
   pull_request:
-    branches: [ryty-gpu]
+    branches: [main]
 
 permissions:
   contents: read
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   renderer:
-    name: Compile Vulkan renderer
+    name: Compile renderer host libraries
     runs-on: windows-2022
     timeout-minutes: 90
     steps:

@@ -9,6 +9,7 @@
 #if defined(_WIN32) || defined(__x86_64__)
 #include <intrin.h>
 #endif
+#include "common/diagnostics.h"
 #include "common/types.h"
 #include "common/diagnostics.h"
 
@@ -33,6 +34,27 @@ struct DiagnosticCounter {
 };
 #else
 using DiagnosticCounter = std::atomic<u64>;
+#endif
+
+#ifdef SHADGT_DIAGNOSTICS
+using DiagnosticCounter = std::atomic<u64>;
+#else
+/// Without diagnostics, a counter only the reports read: counting compiles to nothing.
+struct DiagnosticCounter {
+    constexpr u64 operator++() noexcept {
+        return 0;
+    }
+    constexpr DiagnosticCounter& operator+=(u64) noexcept {
+        return *this;
+    }
+    constexpr u64 fetch_add(u64, std::memory_order = std::memory_order_seq_cst) noexcept {
+        return 0;
+    }
+    constexpr void store(u64, std::memory_order = std::memory_order_seq_cst) noexcept {}
+    constexpr u64 load(std::memory_order = std::memory_order_seq_cst) const noexcept {
+        return 0;
+    }
+};
 #endif
 
 /// PERF-DIAG-010: work done by the emulator's GPU frontend, read and reset by the monitor.
@@ -73,7 +95,14 @@ inline WorkCounters& GetWorkCounters() {
 
 /// Experimental-branch switch: false when the PERF id (e.g. 14 for PERF-014) is listed in the
 /// SHADGT_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
+/// An A/B switch: without diagnostics every feature is on, as with the variable unset.
+#ifdef SHADGT_DIAGNOSTICS
 bool PerfFeatureEnabled(u32 id);
+#else
+constexpr bool PerfFeatureEnabled(u32) {
+    return true;
+}
+#endif
 
 /// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.
 enum class Phase : u32 {
@@ -126,6 +155,13 @@ void NoteGameFrame();
 inline void NoteGameFrame() noexcept {}
 #endif
 
+/// PERF-GT7-033: the game frames presented so far, and their total time in microseconds.
+struct GameFrameTotals {
+    u64 frames;
+    u64 us;
+};
+GameFrameTotals GetGameFrameTotals();
+
 // PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the
 // tick array are inline instead of function calls.
 #ifdef SHADGT_DIAGNOSTICS
@@ -153,6 +189,14 @@ public:
         static const bool enabled = !LeanRun();
         return enabled;
     }
+#else
+    // Without diagnostics the timers cost nothing: about 30 of them run per draw, each with two
+    // TSC reads and an atomic add on cache lines the decode and recorder threads share.
+    explicit constexpr PhaseTimer(Phase) noexcept {}
+    static constexpr bool Enabled() {
+        return false;
+    }
+#endif
     static u64 ReadTsc() {
 #if defined(_WIN32) || defined(__x86_64__)
         return __rdtsc();
@@ -162,14 +206,10 @@ public:
     }
     static u64 ReadTscFallback();
 
+#ifdef SHADGT_DIAGNOSTICS
 private:
     Phase phase;
     u64 start;
-#else
-    explicit constexpr PhaseTimer(Phase) noexcept {}
-    static constexpr bool Enabled() noexcept { return false; }
-    static constexpr u64 ReadTsc() noexcept { return 0; }
-    static constexpr u64 ReadTscFallback() noexcept { return 0; }
 #endif
 };
 #ifdef SHADGT_DIAGNOSTICS

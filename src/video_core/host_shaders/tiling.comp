@@ -15,8 +15,6 @@ layout(constant_id = 2) const uint MICRO_TILE_THICKNESS = 1;
 layout(constant_id = 3) const uint IS_TILER = 0;
 layout(constant_id = 12) const uint IS_BGR_PACKED_FLOAT = 0;
 layout(constant_id = 13) const uint IS_LINEAR = 0;
-// Native packed downloads must leave row and image padding as guest memory held it.
-layout(constant_id = 14) const uint PRESERVE_PACKED_PADDING = 0;
 #if IS_MACRO_TILED
 layout(constant_id = 4) const uint ARRAY_MODE = 0;
 layout(constant_id = 5) const uint PIPE_CONFIG = 0;
@@ -476,10 +474,9 @@ void main() {
         tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, MICRO_TILE_THICKNESS, 0);
 #endif
     }
-    if (tiled_offset / BYTES_PER_PIXEL >= tiled_data.length()) return;
 
     if (IS_TILER != 0) {
-        BLOCK_TYPE value = linear_data[linear_index];
+        BLOCK_TYPE value = linear_data[gl_GlobalInvocationID.x];
 #if BITS_PER_PIXEL == 32
         if (IS_BGR_PACKED_FLOAT != 0) {
             value = (value >> 22) | (((value >> 11) & 0x7ffu) << 10) |
@@ -495,6 +492,6 @@ void main() {
                     ((value & 0x3ffu) << 22);
         }
 #endif
-        linear_data[linear_index] = value;
+        linear_data[gl_GlobalInvocationID.x] = value;
     }
 }

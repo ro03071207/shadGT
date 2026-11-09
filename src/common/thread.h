@@ -41,7 +41,6 @@ void PreferEfficiencyCores();
 /// PERF-GT7-024: pipeline builds: on hybrid CPUs as PreferEfficiencyCores; on CPUs with one kind
 /// of core, the compile cores (the last third of the cores, both hardware threads of each).
 void PreferCompileCores();
-void ReleaseCompileCores();
 
 /// Undoes PreferPerformanceCores/PreferEfficiencyCores for the calling thread.
 void UpdateCoreOwner(u32 slot, bool wanted); ///< PERF-GT7-048
@@ -56,7 +55,6 @@ bool HybridCpu();
 /// found running in nvgpucomp64.dll is moved. Called every 2 s. RYGT_COMPILE_CORES=0 turns the
 /// compile cores off.
 void ConfineDriverCompileThreads();
-void ReleaseDriverCompileThreads();
 /// PERF-GT7-054: calls `fn(handle, thread id)` for each of this process's threads, the handle
 /// opened for `access`; fn returns true to keep the handle, else it is closed. False when the
 /// walk is unavailable (no NtGetNextThread): the caller falls back to a Toolhelp snapshot, which
@@ -74,6 +72,13 @@ bool CompileCoresWide();
 /// build), compile work uses every core below normal priority, taking the time the game's and the
 /// renderer's threads leave. Not while a draw waits for its pipeline. Calls nest.
 void SetCompileCatchUp(bool on);
+/// FIX-GT7-106: while many draws on screen wait for their pipelines (a first race: the world is
+/// missing), compile work uses every core below normal priority, even while a thread builds a
+/// pipeline it waits for. Calls nest.
+void SetCompileBacklog(bool on);
+/// FIX-GT7-109: while the game is in a race, compile work never widens (waits, catch-ups and
+/// backlogs keep it on its cores).
+void SetCompileInPlay(bool on);
 /// PERF-GT7-032: compile work runs below normal priority now.
 bool CompileThreadsLow();
 

@@ -36,9 +36,7 @@ struct VertexAttribute {
         return static_cast<InstanceIdType>(instance_data);
     }
 
-    AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept;
-
-    AmdGpu::Buffer GetSharpFromMemory(const Shader::Info& info) const noexcept {
+    AmdGpu::Buffer GetSharp(const Shader::Info& info) const noexcept {
         auto buffer = info.ReadFetchSharp(sgpr_base, dword_offset);
         buffer.base_address += inst_offset;
         if (data_format) {
@@ -99,5 +97,13 @@ struct FetchShaderData {
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data);
+
+/// PERF-GT7-111 (TEST): a translation made again from the precompile manifest takes its fetch
+/// shader's description from the manifest: the fetch code itself is not needed.
+struct FetchOverride {
+    bool ok = false;
+    FetchShaderData data;
+};
+extern thread_local const FetchOverride* t_fetch_override;
 
 } // namespace Shader::Gcn
